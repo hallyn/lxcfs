@@ -49,6 +49,8 @@
 #include <nih/error.h>
 #include <nih/string.h>
 
+#include "cgmanager.h"
+
 static NihDBusProxy *cgroup_manager = NULL;
 static int32_t api_version;
 
@@ -104,7 +106,7 @@ static bool cgm_dbus_connect(void)
 	return true;
 }
 
-bool lxcfs_get_controllers(char ***contrls)
+bool cgm_get_controllers(char ***contrls)
 {
 	if (!cgm_dbus_connect()) {
 		return false;
@@ -113,7 +115,7 @@ bool lxcfs_get_controllers(char ***contrls)
 	if ( cgmanager_list_controllers_sync(NULL, cgroup_manager, contrls) != 0 ) {
 		NihError *nerr;
 		nerr = nih_error_get();
-		fprintf(stderr, "call to cgmanager_create_sync failed: %s", nerr->message);
+		fprintf(stderr, "call to list_controllers failed: %s", nerr->message);
 		nih_free(nerr);
 		cgm_dbus_disconnect();
 		return false;
@@ -121,4 +123,64 @@ bool lxcfs_get_controllers(char ***contrls)
 
 	cgm_dbus_disconnect();
 	return true;
+}
+
+bool cgm_list_keys(const char *controller, const char *cgroup, struct cgm_keys ***keys)
+{
+	if (!cgm_dbus_connect()) {
+		return false;
+	}
+
+	if ( cgmanager_list_keys_sync(NULL, cgroup_manager, controller, cgroup,
+				(CgmanagerListKeysOutputElement ***)keys) != 0 ) {
+		NihError *nerr;
+		nerr = nih_error_get();
+		fprintf(stderr, "call to list_keys failed: %s", nerr->message);
+		nih_free(nerr);
+		cgm_dbus_disconnect();
+		return false;
+	}
+
+	cgm_dbus_disconnect();
+	return true;
+}
+
+bool cgm_list_children(const char *controller, const char *cgroup, char ***list)
+{
+	if (!cgm_dbus_connect()) {
+		return false;
+	}
+
+	if ( cgmanager_list_children_sync(NULL, cgroup_manager, controller, cgroup, list) != 0 ) {
+		NihError *nerr;
+		nerr = nih_error_get();
+		fprintf(stderr, "call to list_keys failed: %s", nerr->message);
+		nih_free(nerr);
+		cgm_dbus_disconnect();
+		return false;
+	}
+
+	cgm_dbus_disconnect();
+	return true;
+}
+
+char *cgm_get_pid_cgroup(pid_t pid, const char *controller)
+{
+	char *output = NULL;
+
+	if (!cgm_dbus_connect()) {
+		return NULL;
+	}
+
+	if ( cgmanager_get_pid_cgroup_sync(NULL, cgroup_manager, controller, pid, &output) != 0 ) {
+		NihError *nerr;
+		nerr = nih_error_get();
+		fprintf(stderr, "call to list_keys failed: %s", nerr->message);
+		nih_free(nerr);
+		cgm_dbus_disconnect();
+		return NULL;
+	}
+
+	cgm_dbus_disconnect();
+	return output;
 }
