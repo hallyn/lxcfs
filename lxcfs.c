@@ -30,6 +30,9 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include <nih/alloc.h>
+
+#include "cgmanager.h"
 
 static int lxcfs_getattr(const char *path, struct stat *sb)
 {
@@ -69,11 +72,20 @@ static int lxcfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, of
 {
 	if (strcmp(path, "/cgroup") == 0) {
 		// get list of controllers
-		if (filler(buf, "blkio", NULL, 0) != 0 ||
-				filler(buf, "freezer", NULL, 0) != 0) {
-			printf("error filling in controllers\n");
-			return -EINVAL;
+		char **list;
+		int i;
+
+		if (!lxcfs_get_controllers(&list))
+			return -EIO;
+		/* TODO - collect the list of controllers at fuse_init */
+		for (i = 0;  list[i]; i++) {
+			if (filler(buf, list[i], NULL, 0) != 0) {
+				fprintf(stderr, "error filling in controllers\n");
+				nih_free(list);
+				return -EIO;
+			}
 		}
+		nih_free(list);
 		return 0;
 	} else if (strncmp(path, "/cgroup/", 8) == 0) {
 		// return list of keys for the controller, and list of child cgroups
