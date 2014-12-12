@@ -154,7 +154,7 @@ bool cgm_list_children(const char *controller, const char *cgroup, char ***list)
 	if ( cgmanager_list_children_sync(NULL, cgroup_manager, controller, cgroup, list) != 0 ) {
 		NihError *nerr;
 		nerr = nih_error_get();
-		fprintf(stderr, "call to list_keys failed: %s", nerr->message);
+		fprintf(stderr, "call to list_children failed: %s", nerr->message);
 		nih_free(nerr);
 		cgm_dbus_disconnect();
 		return false;
@@ -175,7 +175,7 @@ char *cgm_get_pid_cgroup(pid_t pid, const char *controller)
 	if ( cgmanager_get_pid_cgroup_sync(NULL, cgroup_manager, controller, pid, &output) != 0 ) {
 		NihError *nerr;
 		nerr = nih_error_get();
-		fprintf(stderr, "call to list_keys failed: %s", nerr->message);
+		fprintf(stderr, "call to get_pid_cgroup failed: %s", nerr->message);
 		nih_free(nerr);
 		cgm_dbus_disconnect();
 		return NULL;
@@ -183,4 +183,23 @@ char *cgm_get_pid_cgroup(pid_t pid, const char *controller)
 
 	cgm_dbus_disconnect();
 	return output;
+}
+
+bool cgm_escape_cgroup(void)
+{
+	if (!cgm_dbus_connect()) {
+		return false;
+	}
+
+	if ( cgmanager_move_pid_abs_sync(NULL, cgroup_manager, "all", "/", (int32_t) getpid()) != 0 ) {
+		NihError *nerr;
+		nerr = nih_error_get();
+		fprintf(stderr, "call to move_pid_abs failed: %s", nerr->message);
+		nih_free(nerr);
+		cgm_dbus_disconnect();
+		return false;
+	}
+
+	cgm_dbus_disconnect();
+	return true;
 }

@@ -49,21 +49,64 @@ struct lxcfs_state {
 };
 #define LXCFS_DATA ((struct lxcfs_state *) fuse_get_context()->private_data)
 
-/*
- * check whether cg is a subdir of pid's cgroup
- */
-static bool is_in_cgroup_ancestor(pid_t pid, const char *controller, const char *cg)
+static bool is_privileged_over(pid_t pid, uid_t uid, uid_t victim)
 {
-	nih_local char* client_cgroup = NULL;
+	if (uid == victim)
+		return true;
 
-	client_cgroup = cgm_get_pid_cgroup(pid, controller);
-	if (!client_cgroup)
-		return false;
-	if (strncmp(client_cgroup, cg, strlen(client_cgroup)) != 0)
-		return false;
-	return true;
+	/* check /proc/pid/uid_map */
+	return false;
 }
 
+static bool perms_include(int fmode, mode_t req_mode)
+{
+	fprintf(stderr, "perms_include: checking whether %d includes %d\n",
+		fmode, req_mode);
+	return (fmode & req_mode) == req_mode;
+}
+
+/*
+ * check whether a fuse context may access a cgroup dir or file
+ *
+ * If file is not null, it is a cgroup file to check under cg.
+ * If file is null, then we are checking perms on cg itself.
+ *
+ * For files we can check the mode of the list_keys result.
+ * For cgroups, we must make assumptions based on the files under the
+ * cgroup, because cgmanager doesn't tell us ownership/perms of cgroups
+ * yet.
+ */
+static bool fc_may_access(struct fuse_context *fc, const char *contrl, const char *cg, const char *file, mode_t mode)
+{
+	nih_local struct cgm_keys **list = NULL;
+	int i;
+
+	if (!file)
+		file = "tasks";
+
+	fprintf(stderr, "XXX doing fc_may_access on %s %s\n", contrl, cg);
+	if (!cgm_list_keys(contrl, cg, &list))
+		return false;
+	fprintf(stderr, "XXX fc_may_access succeeded on %s %s\n", contrl, cg);
+	for (i = 0; list[i]; i++) {
+		if (strcmp(list[i]->name, file) == 0) {
+			struct cgm_keys *k = list[i];
+			fprintf(stderr, "XXX fc_may_access: found %s\n", file);
+			// check list[i]->uid, gid, mode against fc
+			if (is_privileged_over(fc->pid, fc->uid, k->uid)) {
+				if (perms_include(k->mode >> 6, mode))
+					return true;
+			}
+			if (fc->gid == k->gid) {
+				if (perms_include(k->mode >> 3, mode))
+					return true;
+			}
+			return perms_include(k->mode, mode);
+		}
+	}
+
+	return false;
+}
 
 /*
  * given /cgroup/freezer/a/b, return "freezer".  this will be nih-allocated
@@ -77,15 +120,12 @@ static char *pick_controller_from_path(struct fuse_context *fc, const char *path
 	if (strlen(path) < 9)
 		return NULL;
 	p1 = path+8;
-	ret = nih_strdup(NULL, p1+1);
+	ret = nih_strdup(NULL, p1);
 	if (!ret)
 		return ret;
 	slash = strstr(ret, "/");
-	if (!slash) {
-		nih_free(ret);
-		return NULL;
-	}
-	*slash = '\0';
+	if (slash)
+		*slash = '\0';
 
 	/* verify that it is a subsystem */
 	char **list = LXCFS_DATA ? LXCFS_DATA->subsystems : NULL;
@@ -155,22 +195,53 @@ static struct cgm_keys *get_cgroup_key(const char *contr, const char *dir, const
 	return NULL;
 }
 
+static void get_cgdir_and_path(const char *cg, char **dir, char **file)
+{
+#if 0
+	nih_local char *cgcopy = NULL;
+	nih_local struct cgm_keys *k = NULL;
+	char *cgdir, *fpath = strrchr(cgroup, '/');
+	cgcopy = NIH_MUST( nih_strdup(NULL, cgroup) );
+	cgdir = dirname(cgcopy);
+#endif
+	char *p;
+
+	*dir = NIH_MUST( nih_strdup(NULL, cg) );
+	*file = strrchr(cg, '/');
+	if (!*file) {
+		*file = NULL;
+		return;
+	}
+	p = strrchr(*dir, '/');
+	*p = '\0';
+}
+
+/*
+ * gettattr fn for anything under /cgroup
+ */
 static int cg_getattr(const char *path, struct stat *sb)
 {
 	struct timespec now;
 	struct fuse_context *fc = fuse_get_context();
+	nih_local char * cgdir = NULL;
+	char *fpath = NULL;
+	nih_local struct cgm_keys *k = NULL;
+
 
 	if (!fc)
 		return -EIO;
 
+	fprintf(stderr, "XXX getattr 2 got request for cgroup file %s\n", path);
 	memset(sb, 0, sizeof(struct stat));
 
 	if (clock_gettime(CLOCK_REALTIME, &now) < 0)
 		return -EINVAL;
+	fprintf(stderr, "XXX getattr 3 got request for cgroup file %s\n", path);
 
 	sb->st_uid = sb->st_gid = 0;
 	sb->st_atim = sb->st_mtim = sb->st_ctim = now;
 	sb->st_size = 0;
+	fprintf(stderr, "XXX getattr 4 got request for cgroup file %s\n", path);
 
 	if (strcmp(path, "/cgroup") == 0) {
 		sb->st_mode = S_IFDIR | 00755;
@@ -178,7 +249,7 @@ static int cg_getattr(const char *path, struct stat *sb)
 		return 0;
 	}
 
-	printf("got request for cgroup file %s\n", path);
+	fprintf(stderr, "XXX getattr 5 got request for cgroup file %s\n", path);
 
 	const char *cgroup;
 	nih_local char *controller = NULL;
@@ -186,7 +257,7 @@ static int cg_getattr(const char *path, struct stat *sb)
 	controller = pick_controller_from_path(fc, path);
 	if (!controller)
 		return -EIO;
-	printf("XXX controller %s\n", controller);
+	fprintf(stderr, "XXX getattr controller %s\n", controller);
 	cgroup = find_cgroup_in_path(path);
 	if (!cgroup) {
 		/* this is just /cgroup/controller, return it as a dir */
@@ -195,37 +266,29 @@ static int cg_getattr(const char *path, struct stat *sb)
 		return 0;
 	}
 	
-	/* is this whole thing a cgroup, or does it end in a filename? */
-	nih_local char *cgcopy = NULL;
-	nih_local struct cgm_keys *k = NULL;
-	char *cgdir, *fpath = strrchr(cgroup, '/');
-	if (!fpath)
-		return -EINVAL;
-	cgcopy = NIH_MUST( nih_strdup(NULL, cgroup) );
-	cgdir = dirname(cgcopy);
+	fprintf(stderr, "XXX getattr controller %s cgroup %s\n", controller, cgroup);
 
-	/*
-	 * TODO - which permissions to check?  
-	 * do we check in all parent directories, or only from caller's
-	 * cgroup up to the target cgroup?
-	 */
+	get_cgdir_and_path(cgroup, &cgdir, &fpath);
+
+	fprintf(stderr, "XXX getattr cgdir %s fpath %s\n", cgdir, fpath ? fpath : "(none)");
 
 	/* check that cgcopy is either a child cgroup of cgdir, or listed in its keys.
 	 * Then check that caller's cgroup is under path if fpath is a child
 	 * cgroup, or cgdir if fpath is a file */
-	if (is_child_cgroup(controller, cgdir, fpath)) {
-		if (!is_in_cgroup_ancestor(fc->pid, controller, cgroup))
+	if (!fpath || is_child_cgroup(controller, cgdir, fpath)) {
+		if (!fc_may_access(fc, controller, cgroup, NULL, O_RDONLY))
 			return -EPERM;
-		// TODO check the dir perms
 
 		sb->st_mode = S_IFDIR | 00755;   // TODO what to use?
-		// TODO - uid, gid
+		// TODO - how to get uid, gid
+		sb->st_uid = sb->st_gid = 0;
 		sb->st_nlink = 2;
 		return 0;
-	} else if ((k = get_cgroup_key(controller, cgdir, fpath)) != NULL) {
-		if (!is_in_cgroup_ancestor(fc->pid, controller, cgdir))
+	} else if (fpath && (k = get_cgroup_key(controller, cgdir, fpath)) != NULL) {
+		if (!fc_may_access(fc, controller, cgdir, fpath, O_RDONLY))
 			return -EPERM;
-		// TODO check the dir perms
+
+		fprintf(stderr, "XXX getattr passed prelim security checks\n");
 
 		// TODO - convert uid, gid
 		sb->st_mode = k->mode;
@@ -243,6 +306,9 @@ static int cg_opendir(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
+/*
+ * readdir function for anything under /cgroup
+ */
 static int cg_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
 		struct fuse_file_info *fi)
 {
@@ -266,7 +332,7 @@ static int cg_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 		}
 		return 0;
 	}
-	printf("XXX 1 XXX\n");
+	fprintf(stderr, "XXX readdir 1 XXX\n");
 
 	// return list of keys for the controller, and list of child cgroups
 	struct cgm_keys **list;
@@ -277,19 +343,23 @@ static int cg_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 	controller = pick_controller_from_path(fc, path);
 	if (!controller)
 		return -EIO;
-	printf("XXX controller %s\n", controller);
-	cgroup = find_cgroup_in_path(path);
-	if (!cgroup)
-		return -EIO;
+	fprintf(stderr, "XXX readdir: controller %s\n", controller);
 
-	printf("XXX got contr %s cg %s\n", controller, cgroup);
-	if (!is_in_cgroup_ancestor(fc->pid, controller, cgroup))
+	cgroup = find_cgroup_in_path(path);
+	if (!cgroup) {
+		/* this is just /cgroup/controller, return its contents */
+		cgroup = "/";
+	}
+
+	if (!fc_may_access(fc, controller, cgroup, NULL, O_RDONLY))
 		return -EPERM;
-	printf("XXX it is under cgroup\n");
-	if (!cgm_list_keys(controller, path + strlen(controller) + 9, &list))
+
+	fprintf(stderr, "XXX readdir: permission granted\n");
+	if (!cgm_list_keys(controller, cgroup, &list))
 		return -EINVAL;
-	printf("XXX got keys\n");
+	fprintf(stderr, "XXX readdir: got keys\n");
 	for (i = 0; list[i]; i++) {
+		fprintf(stderr, "adding key %s\n", list[i]->name);
 		if (filler(buf, list[i]->name, NULL, 0) != 0) {
 			nih_free(list);
 			return -EIO;
@@ -474,9 +544,9 @@ const struct fuse_operations lxcfs_ops = {
 
 void usage(const char *me)
 {
-	printf("Usage:\n");
-	printf("\n");
-	printf("%s [FUSE and mount options] mountpoint\n", me);
+	fprintf(stderr, "Usage:\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "%s [FUSE and mount options] mountpoint\n", me);
 	exit(1);
 }
 
@@ -501,6 +571,10 @@ int main(int argc, char *argv[])
 	d = malloc(sizeof(*d));
 	if (!d)
 		return -1;
+
+	if (!cgm_escape_cgroup())
+		fprintf(stderr, "WARNING: failed to escape to root cgroup\n");
+
 	if (!cgm_get_controllers(&d->subsystems))
 		return -1;
 
