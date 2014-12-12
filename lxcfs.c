@@ -84,10 +84,11 @@ static bool fc_may_access(struct fuse_context *fc, const char *contrl, const cha
 	if (!file)
 		file = "tasks";
 
-	fprintf(stderr, "XXX doing fc_may_access on %s %s\n", contrl, cg);
+	if (*file == '/')
+		file++;
+
 	if (!cgm_list_keys(contrl, cg, &list))
 		return false;
-	fprintf(stderr, "XXX fc_may_access succeeded on %s %s\n", contrl, cg);
 	for (i = 0; list[i]; i++) {
 		if (strcmp(list[i]->name, file) == 0) {
 			struct cgm_keys *k = list[i];
@@ -163,6 +164,11 @@ static bool is_child_cgroup(const char *contr, const char *dir, const char *f)
 	nih_local char **list = NULL;
 	int i;
 
+	if (!f)
+		return false;
+	if (*f == '/')
+		f++;
+
 	if (!cgm_list_children(contr, dir, &list))
 		return false;
 	for (i = 0; list[i]; i++) {
@@ -179,6 +185,10 @@ static struct cgm_keys *get_cgroup_key(const char *contr, const char *dir, const
 	struct cgm_keys *k;
 	int i;
 
+	if (!f)
+		return NULL;
+	if (*f == '/')
+		f++;
 	if (!cgm_list_keys(contr, dir, &list))
 		return NULL;
 	for (i = 0; list[i]; i++) {
@@ -224,35 +234,29 @@ static int cg_getattr(const char *path, struct stat *sb)
 	struct timespec now;
 	struct fuse_context *fc = fuse_get_context();
 	nih_local char * cgdir = NULL;
-	char *fpath = NULL;
+	char *fpath = NULL, *path1, *path2;
 	nih_local struct cgm_keys *k = NULL;
+	const char *cgroup;
+	nih_local char *controller = NULL;
 
 
 	if (!fc)
 		return -EIO;
 
-	fprintf(stderr, "XXX getattr 2 got request for cgroup file %s\n", path);
 	memset(sb, 0, sizeof(struct stat));
 
 	if (clock_gettime(CLOCK_REALTIME, &now) < 0)
 		return -EINVAL;
-	fprintf(stderr, "XXX getattr 3 got request for cgroup file %s\n", path);
 
 	sb->st_uid = sb->st_gid = 0;
 	sb->st_atim = sb->st_mtim = sb->st_ctim = now;
 	sb->st_size = 0;
-	fprintf(stderr, "XXX getattr 4 got request for cgroup file %s\n", path);
 
 	if (strcmp(path, "/cgroup") == 0) {
 		sb->st_mode = S_IFDIR | 00755;
 		sb->st_nlink = 2;
 		return 0;
 	}
-
-	fprintf(stderr, "XXX getattr 5 got request for cgroup file %s\n", path);
-
-	const char *cgroup;
-	nih_local char *controller = NULL;
 
 	controller = pick_controller_from_path(fc, path);
 	if (!controller)
@@ -270,12 +274,21 @@ static int cg_getattr(const char *path, struct stat *sb)
 
 	get_cgdir_and_path(cgroup, &cgdir, &fpath);
 
-	fprintf(stderr, "XXX getattr cgdir %s fpath %s\n", cgdir, fpath ? fpath : "(none)");
+	if (!fpath) {
+		path1 = "/";
+		path2 = cgdir;
+	} else {
+		path1 = cgdir;
+		path2 = fpath;
+	}
+
+	fprintf(stderr, "XXX gettattr: dir is %s, basename %s\n", path1, path2);
 
 	/* check that cgcopy is either a child cgroup of cgdir, or listed in its keys.
 	 * Then check that caller's cgroup is under path if fpath is a child
 	 * cgroup, or cgdir if fpath is a file */
-	if (!fpath || is_child_cgroup(controller, cgdir, fpath)) {
+
+	if (is_child_cgroup(controller, path1, path2)) {
 		if (!fc_may_access(fc, controller, cgroup, NULL, O_RDONLY))
 			return -EPERM;
 
@@ -284,14 +297,16 @@ static int cg_getattr(const char *path, struct stat *sb)
 		sb->st_uid = sb->st_gid = 0;
 		sb->st_nlink = 2;
 		return 0;
-	} else if (fpath && (k = get_cgroup_key(controller, cgdir, fpath)) != NULL) {
-		if (!fc_may_access(fc, controller, cgdir, fpath, O_RDONLY))
+	}
+
+	if ((k = get_cgroup_key(controller, path1, path2)) != NULL) {
+		if (!fc_may_access(fc, controller, path1, path2, O_RDONLY))
 			return -EPERM;
 
-		fprintf(stderr, "XXX getattr passed prelim security checks\n");
+		fprintf(stderr, "XXX getattr mode on %s %s %s is %d\n", controller, path1, path2, k->mode);
 
 		// TODO - convert uid, gid
-		sb->st_mode = k->mode;
+		sb->st_mode = S_IFREG | k->mode;
 		sb->st_uid = k->uid;
 		sb->st_gid = k->gid;
 		sb->st_nlink = 1;
@@ -332,10 +347,9 @@ static int cg_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 		}
 		return 0;
 	}
-	fprintf(stderr, "XXX readdir 1 XXX\n");
 
 	// return list of keys for the controller, and list of child cgroups
-	struct cgm_keys **list;
+	nih_local struct cgm_keys **list = NULL;
 	const char *cgroup;
 	nih_local char *controller = NULL;
 	int i;
@@ -343,7 +357,6 @@ static int cg_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 	controller = pick_controller_from_path(fc, path);
 	if (!controller)
 		return -EIO;
-	fprintf(stderr, "XXX readdir: controller %s\n", controller);
 
 	cgroup = find_cgroup_in_path(path);
 	if (!cgroup) {
@@ -354,20 +367,26 @@ static int cg_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 	if (!fc_may_access(fc, controller, cgroup, NULL, O_RDONLY))
 		return -EPERM;
 
-	fprintf(stderr, "XXX readdir: permission granted\n");
 	if (!cgm_list_keys(controller, cgroup, &list))
 		return -EINVAL;
-	fprintf(stderr, "XXX readdir: got keys\n");
 	for (i = 0; list[i]; i++) {
 		fprintf(stderr, "adding key %s\n", list[i]->name);
 		if (filler(buf, list[i]->name, NULL, 0) != 0) {
-			nih_free(list);
 			return -EIO;
 		}
 	}
-	nih_free(list);
 
 	// now get the list of child cgroups
+	nih_local char **clist;
+
+	if (!cgm_list_children(controller, cgroup, &clist))
+		return 0;
+	for (i = 0; clist[i]; i++) {
+		fprintf(stderr, "adding child %s\n", clist[i]);
+		if (filler(buf, clist[i], NULL, 0) != 0) {
+			return -EIO;
+		}
+	}
 	return 0;
 }
 
