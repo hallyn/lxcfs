@@ -441,8 +441,17 @@ const struct fuse_operations cg_ops = {
 	.fgetattr = NULL,
 };
 
+static int proc_getattr(const char *path, struct stat *sb)
+{
+	if (strcmp(path, "/proc") != 0)
+		return -EINVAL;
+	sb->st_mode = S_IFDIR | 00755;
+	sb->st_nlink = 2;
+	return 0;
+}
+
 const struct fuse_operations proc_ops = {
-	.getattr = NULL,
+	.getattr = proc_getattr,
 	.readlink = NULL,
 	.getdir = NULL,
 	.mknod = NULL,
@@ -484,14 +493,25 @@ const struct fuse_operations proc_ops = {
 
 static int lxcfs_getattr(const char *path, struct stat *sb)
 {
+	if (strcmp(path, "/") == 0) {
+		sb->st_mode = S_IFDIR | 00755;
+		sb->st_nlink = 2;
+		return 0;
+	}
 	if (strncmp(path, "/cgroup", 7) == 0) {
 		return cg_getattr(path, sb);
+	}
+	if (strncmp(path, "/proc", 7) == 0) {
+		return proc_getattr(path, sb);
 	}
 	return -EINVAL;
 }
 
 static int lxcfs_opendir(const char *path, struct fuse_file_info *fi)
 {
+	if (strcmp(path, "/") == 0)
+		return 0;
+
 	if (strncmp(path, "/cgroup", 7) == 0) {
 		return cg_opendir(path, fi);
 	}
@@ -501,6 +521,12 @@ static int lxcfs_opendir(const char *path, struct fuse_file_info *fi)
 static int lxcfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
 		struct fuse_file_info *fi)
 {
+	if (strcmp(path, "/") == 0) {
+		if (filler(buf, "proc", NULL, 0) != 0 ||
+				filler(buf, "cgroup", NULL, 0) != 0)
+			return -EINVAL;
+		return 0;
+	}
 	if (strncmp(path, "/cgroup", 7) == 0) {
 		return cg_readdir(path, buf, filler, offset, fi);
 	}
@@ -509,6 +535,8 @@ static int lxcfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, of
 
 static int lxcfs_releasedir(const char *path, struct fuse_file_info *fi)
 {
+	if (strcmp(path, "/") == 0)
+		return 0;
 	if (strncmp(path, "/cgroup", 7) == 0) {
 		return cg_releasedir(path, fi);
 	}
