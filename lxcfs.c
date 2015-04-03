@@ -837,9 +837,12 @@ static void pid_to_ns(int sock, pid_t tpid)
  */
 static void pid_to_ns_wrapper(int sock, pid_t tpid)
 {
-	int newnsfd = -1;
+	int newnsfd = -1, ret, cpipe[2];
 	char fnam[100];
 	pid_t cpid;
+	struct timeval tv;
+	fd_set s;
+	char v;
 
 	sprintf(fnam, "/proc/%d/ns/pid", tpid);
 	newnsfd = open(fnam, O_RDONLY);
@@ -849,15 +852,47 @@ static void pid_to_ns_wrapper(int sock, pid_t tpid)
 		exit(1);
 	close(newnsfd);
 
+	if (pipe(cpipe) < 0)
+		exit(1);
+
+loop:
 	cpid = fork();
 
 	if (cpid < 0)
 		exit(1);
-	if (!cpid)
+
+	if (!cpid) {
+		char b = '1';
+		close(cpipe[0]);
+		if (write(cpipe[1], &b, sizeof(char)) < 0) {
+			fprintf(stderr, "%s (child): erorr on write: %s\n",
+				__func__, strerror(errno));
+		}
+		close(cpipe[1]);
 		pid_to_ns(sock, tpid);
+	}
+	// give the child 1 second to be done forking and
+	// write it's ack
+	FD_ZERO(&s);
+	FD_SET(cpipe[0], &s);
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+	ret = select(cpipe[0]+1, &s, NULL, NULL, &tv);
+	if (ret < 0)
+		goto again;
+	ret = read(cpipe[0], &v, 1);
+	if (ret != sizeof(char) || v != '1') {
+		goto again;
+	}
+
 	if (!wait_for_pid(cpid))
 		exit(1);
 	exit(0);
+
+again:
+	kill(cpid, SIGTERM);
+	wait_for_pid(cpid);
+	goto loop;
 }
 
 /*
@@ -1039,7 +1074,7 @@ static void pid_from_ns(int sock, pid_t tpid)
 		tv.tv_usec = 0;
 		ret = select(sock+1, &s, NULL, NULL, &tv);
 		if (ret < 0) {
-			fprintf(stderr, "%s: bad jelect before read from parent: %s\n",
+			fprintf(stderr, "%s: bad select before read from parent: %s\n",
 				__func__, strerror(errno));
 			exit(1);
 		}
@@ -1064,9 +1099,12 @@ static void pid_from_ns(int sock, pid_t tpid)
 
 static void pid_from_ns_wrapper(int sock, pid_t tpid)
 {
-	int newnsfd = -1;
+	int newnsfd = -1, ret, cpipe[2];
 	char fnam[100];
 	pid_t cpid;
+	fd_set s;
+	struct timeval tv;
+	char v;
 
 	sprintf(fnam, "/proc/%d/ns/pid", tpid);
 	newnsfd = open(fnam, O_RDONLY);
@@ -1076,15 +1114,48 @@ static void pid_from_ns_wrapper(int sock, pid_t tpid)
 		exit(1);
 	close(newnsfd);
 
+	if (pipe(cpipe) < 0)
+		exit(1);
+
+loop:
 	cpid = fork();
 
 	if (cpid < 0)
 		exit(1);
-	if (!cpid)
+
+	if (!cpid) {
+		char b = '1';
+		close(cpipe[0]);
+		if (write(cpipe[1], &b, sizeof(char)) < 0) {
+			fprintf(stderr, "%s (child): erorr on write: %s\n",
+				__func__, strerror(errno));
+		}
+		close(cpipe[1]);
 		pid_from_ns(sock, tpid);
+	}
+
+	// give the child 1 second to be done forking and
+	// write it's ack
+	FD_ZERO(&s);
+	FD_SET(cpipe[0], &s);
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+	ret = select(cpipe[0]+1, &s, NULL, NULL, &tv);
+	if (ret < 0)
+		goto again;
+	ret = read(cpipe[0], &v, 1);
+	if (ret != sizeof(char) || v != '1') {
+		goto again;
+	}
+
 	if (!wait_for_pid(cpid))
 		exit(1);
 	exit(0);
+
+again:
+	kill(cpid, SIGTERM);
+	wait_for_pid(cpid);
+	goto loop;
 }
 
 static bool do_write_pids(pid_t tpid, const char *contrl, const char *cg, const char *file, const char *buf)
