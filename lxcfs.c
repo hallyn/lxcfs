@@ -857,7 +857,6 @@ static void pid_to_ns_wrapper(int sock, pid_t tpid)
 
 loop:
 	cpid = fork();
-
 	if (cpid < 0)
 		exit(1);
 
@@ -890,7 +889,7 @@ loop:
 	exit(0);
 
 again:
-	kill(cpid, SIGTERM);
+	kill(cpid, SIGKILL);
 	wait_for_pid(cpid);
 	goto loop;
 }
@@ -1153,7 +1152,7 @@ loop:
 	exit(0);
 
 again:
-	kill(cpid, SIGTERM);
+	kill(cpid, SIGKILL);
 	wait_for_pid(cpid);
 	goto loop;
 }
@@ -1841,10 +1840,12 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 static long int get_pid1_time(pid_t pid)
 {
 	char fnam[100];
-	int fd;
+	int fd, cpipe[2], ret;
 	struct stat sb;
-	int ret;
-	pid_t npid;
+	pid_t cpid;
+	struct timeval tv;
+	fd_set s;
+	char v;
 
 	if (unshare(CLONE_NEWNS))
 		return 0;
@@ -1866,28 +1867,57 @@ static long int get_pid1_time(pid_t pid)
 		return 0;
 	}
 	close(fd);
-	npid = fork();
-	if (npid < 0)
+
+	if (pipe(cpipe) < 0)
+		exit(1);
+
+loop:
+	cpid = fork();
+	if (cpid < 0)
 		return 0;
 
-	if (npid) {
-		// child will do the writing for us
-		wait_for_pid(npid);
-		exit(0);
+	if (!cpid) {
+		char b = '1';
+		close(cpipe[0]);
+		if (write(cpipe[1], &b, sizeof(char)) < 0) {
+			fprintf(stderr, "%s (child): erorr on write: %s\n",
+				__func__, strerror(errno));
+		}
+		close(cpipe[1]);
+		umount2("/proc", MNT_DETACH);
+		if (mount("proc", "/proc", "proc", 0, NULL)) {
+			perror("get_pid1_time mount");
+			return 0;
+		}
+		ret = lstat("/proc/1", &sb);
+		if (ret) {
+			perror("get_pid1_time lstat");
+			return 0;
+		}
+		return time(NULL) - sb.st_ctime;
 	}
 
-	umount2("/proc", MNT_DETACH);
+	// give the child 1 second to be done forking and
+	// write it's ack
+	FD_ZERO(&s);
+	FD_SET(cpipe[0], &s);
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+	ret = select(cpipe[0]+1, &s, NULL, NULL, &tv);
+	if (ret < 0)
+		goto again;
+	ret = read(cpipe[0], &v, 1);
+	if (ret != sizeof(char) || v != '1') {
+		goto again;
+	}
 
-	if (mount("proc", "/proc", "proc", 0, NULL)) {
-		perror("get_pid1_time mount");
-		return 0;
-	}
-	ret = lstat("/proc/1", &sb);
-	if (ret) {
-		perror("get_pid1_time lstat");
-		return 0;
-	}
-	return time(NULL) - sb.st_ctime;
+	wait_for_pid(cpid);
+	exit(0);
+
+again:
+	kill(cpid, SIGKILL);
+	wait_for_pid(cpid);
+	goto loop;
 }
 
 static long int getreaperage(pid_t qpid)
