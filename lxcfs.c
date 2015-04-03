@@ -689,7 +689,7 @@ static int msgrecv(int sockfd, void *buf, size_t len)
 	tv.tv_sec = 2;
 	tv.tv_usec = 0;
 
-	if (select(sockfd+1, &rfds, NULL, NULL, &tv) < 0)
+	if (select(sockfd+1, &rfds, NULL, NULL, &tv) <= 0)
 		return -1;
 	return recv(sockfd, buf, len, MSG_DONTWAIT);
 }
@@ -785,7 +785,7 @@ static bool recv_creds(int sock, struct ucred *cred, char *v)
 	FD_SET(sock, &rfds);
 	tv.tv_sec = 2;
 	tv.tv_usec = 0;
-	if (select(sock+1, &rfds, NULL, NULL, &tv) < 0) {
+	if (select(sock+1, &rfds, NULL, NULL, &tv) <= 0) {
 		fprintf(stderr, "Failed to select for scm_cred: %s\n",
 			  strerror(errno));
 		return false;
@@ -877,7 +877,7 @@ loop:
 	tv.tv_sec = 1;
 	tv.tv_usec = 0;
 	ret = select(cpipe[0]+1, &s, NULL, NULL, &tv);
-	if (ret < 0)
+	if (ret <= 0)
 		goto again;
 	ret = read(cpipe[0], &v, 1);
 	if (ret != sizeof(char) || v != '1') {
@@ -1072,7 +1072,7 @@ static void pid_from_ns(int sock, pid_t tpid)
 		tv.tv_sec = 2;
 		tv.tv_usec = 0;
 		ret = select(sock+1, &s, NULL, NULL, &tv);
-		if (ret < 0) {
+		if (ret <= 0) {
 			fprintf(stderr, "%s: bad select before read from parent: %s\n",
 				__func__, strerror(errno));
 			exit(1);
@@ -1140,7 +1140,7 @@ loop:
 	tv.tv_sec = 1;
 	tv.tv_usec = 0;
 	ret = select(cpipe[0]+1, &s, NULL, NULL, &tv);
-	if (ret < 0)
+	if (ret <= 0)
 		goto again;
 	ret = read(cpipe[0], &v, 1);
 	if (ret != sizeof(char) || v != '1') {
@@ -1904,7 +1904,7 @@ loop:
 	tv.tv_sec = 1;
 	tv.tv_usec = 0;
 	ret = select(cpipe[0]+1, &s, NULL, NULL, &tv);
-	if (ret < 0)
+	if (ret <= 0)
 		goto again;
 	ret = read(cpipe[0], &v, 1);
 	if (ret != sizeof(char) || v != '1') {
@@ -1946,7 +1946,7 @@ static long int getreaperage(pid_t qpid)
 	tv.tv_sec = 1;
 	tv.tv_usec = 0;
 	ret = select(mypipe[0]+1, &s, NULL, NULL, &tv);
-	if (ret == -1) {
+	if (ret <= 0) {
 		perror("select");
 		goto out;
 	}
