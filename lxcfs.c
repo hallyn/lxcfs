@@ -907,8 +907,12 @@ static bool do_read_pids(pid_t tpid, const char *contrl, const char *cg, const c
 
 		if (ret == SEND_CREDS_NOTSK)
 			goto next;
-		if (ret == SEND_CREDS_FAIL)
+		if (ret == SEND_CREDS_FAIL) {
+			// todo - in this and other cases there are really
+			// two children to kill, not just one.
+			kill(cpid, SIGTERM);
 			goto out;
+		}
 
 		// read converted results
 		FD_ZERO(&s);
