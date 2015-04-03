@@ -752,6 +752,8 @@ static bool recv_creds(int sock, struct ucred *cred, char *v)
 	char buf[1];
 	int ret;
 	int optval = 1;
+	struct timeval tv;
+	fd_set rfds;
 
 	*v = '1';
 
@@ -779,9 +781,15 @@ static bool recv_creds(int sock, struct ucred *cred, char *v)
 	msg.msg_iov = &iov;
 	msg.msg_iovlen = 1;
 
-	// retry logic is not ideal, especially as we are not
-	// threaded.  Sleep at most 1 second waiting for the client
-	// to send us the scm_cred
+	FD_ZERO(&rfds);
+	FD_SET(sock, &rfds);
+	tv.tv_sec = 2;
+	tv.tv_usec = 0;
+	if (select(sock+1, &rfds, NULL, NULL, &tv) < 0) {
+		fprintf(stderr, "Failed to select for scm_cred: %s\n",
+			  strerror(errno));
+		return false;
+	}
 	ret = recvmsg(sock, &msg, 0);
 	if (ret < 0) {
 		fprintf(stderr, "Failed to receive scm_cred: %s\n",
