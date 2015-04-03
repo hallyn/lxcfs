@@ -790,7 +790,7 @@ static bool recv_creds(int sock, struct ucred *cred, char *v)
 			  strerror(errno));
 		return false;
 	}
-	ret = recvmsg(sock, &msg, 0);
+	ret = recvmsg(sock, &msg, MSG_DONTWAIT);
 	if (ret < 0) {
 		fprintf(stderr, "Failed to receive scm_cred: %s\n",
 			  strerror(errno));
@@ -907,26 +907,23 @@ static bool do_read_pids(pid_t tpid, const char *contrl, const char *cg, const c
 
 		if (ret == SEND_CREDS_NOTSK)
 			goto next;
-		if (ret == SEND_CREDS_FAIL) {
-			// todo - in this and other cases there are really
-			// two children to kill, not just one.
-			kill(cpid, SIGTERM);
+		if (ret == SEND_CREDS_FAIL)
 			goto out;
-		}
 
 		// read converted results
 		FD_ZERO(&s);
 		FD_SET(sock[0], &s);
-		tv.tv_sec = 1;
+		tv.tv_sec = 2;
 		tv.tv_usec = 0;
 		ret = select(sock[0]+1, &s, NULL, NULL, &tv);
 		if (ret <= 0) {
-			kill(cpid, SIGTERM);
+			fprintf(stderr, "%s: select error waiting for pid from child: %s\n",
+				__func__, strerror(errno));
 			goto out;
 		}
 		if (read(sock[0], &qpid, sizeof(qpid)) != sizeof(qpid)) {
-			kill(cpid, SIGTERM);
-			perror("read");
+			fprintf(stderr, "%s: error reading pid from child: %s\n",
+				__func__, strerror(errno));
 			goto out;
 		}
 		NIH_MUST( nih_strcat_sprintf(d, NULL, "%d\n", qpid) );
@@ -941,7 +938,8 @@ next:
 	v = '1';
 	if (send_creds(sock[0], &cred, v, true) != SEND_CREDS_OK) {
 		// failed to ask child to exit
-		kill(cpid, SIGTERM);
+		fprintf(stderr, "%s: failed to ask child to exit: %s\n",
+			__func__, strerror(errno));
 		goto out;
 	}
 
@@ -1028,10 +1026,28 @@ static void pid_from_ns(int sock, pid_t tpid)
 	pid_t vpid;
 	struct ucred cred;
 	char v;
+	struct timeval tv;
+	fd_set s;
+	int ret;
 
 	cred.uid = 0;
 	cred.gid = 0;
-	while (read(sock, &vpid, sizeof(pid_t)) == sizeof(pid_t)) {
+	while (1) {
+		FD_ZERO(&s);
+		FD_SET(sock, &s);
+		tv.tv_sec = 2;
+		tv.tv_usec = 0;
+		ret = select(sock+1, &s, NULL, NULL, &tv);
+		if (ret < 0) {
+			fprintf(stderr, "%s: bad jelect before read from parent: %s\n",
+				__func__, strerror(errno));
+			exit(1);
+		}
+		if ((ret = read(sock, &vpid, sizeof(pid_t))) != sizeof(pid_t)) {
+			fprintf(stderr, "%s: bad read from parent: %s\n",
+				__func__, strerror(errno));
+			exit(1);
+		}
 		if (vpid == -1) // done
 			break;
 		v = '0';
@@ -1099,8 +1115,8 @@ static bool do_write_pids(pid_t tpid, const char *contrl, const char *cg, const 
 		char v;
 
 		if (write(sock[0], &qpid, sizeof(qpid)) != sizeof(qpid)) {
-			kill(cpid, SIGTERM);
-			perror("write");
+			fprintf(stderr, "%s: error writing pid to child: %s\n",
+				__func__, strerror(errno));
 			goto out;
 		}
 
