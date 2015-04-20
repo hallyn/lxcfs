@@ -1040,54 +1040,10 @@ static int cg_read(const char *path, char *buf, size_t size, off_t offset,
 	struct file_info *f = (struct file_info *)fi->fh;
 	nih_local struct cgm_keys *k = NULL;
 
-	if (f->type != LXC_TYPE_CGFILE) {
-		fprintf(stderr, "Internal error: directory cache info used in cg_read\n");
-		return -EIO;
-	}
-
-	if (offset)
-		return 0;
-
-	if (!fc)
-		return -EIO;
-
-	if (!f->controller)
-		return -EINVAL;
-
-	if ((k = get_cgroup_key(f->controller, f->cgroup, f->file)) != NULL) {
-		nih_local char *data = NULL;
-		int s;
-		bool r;
-
-		if (!fc_may_access(fc, f->controller, f->cgroup, f->file, O_RDONLY))
-			// should never get here
-			return -EACCES;
-
-		if (strcmp(f->file, "tasks") == 0 ||
-				strcmp(f->file, "/tasks") == 0 ||
-				strcmp(f->file, "/cgroup.procs") == 0 ||
-				strcmp(f->file, "cgroup.procs") == 0)
-			// special case - we have to translate the pids
-			r = do_read_pids(fc->pid, f->controller, f->cgroup, f->file, &data);
-		else
-			r = cgm_get_value(f->controller, f->cgroup, f->file, &data);
-
-		if (!r)
-			return -EINVAL;
-
-		if (!data)
-			return 0;
-		s = strlen(data);
-		if (s > size)
-			s = size;
-		memcpy(buf, data, s);
-		if (s > 0 && s < size && data[s-1] != '\n')
-			buf[s++] = '\n';
-
-		return s;
-	}
-
-	return -EINVAL;
+	fprintf(stderr, "pid is %d\n", (int)fc->pid);
+	sleep(10);
+	fprintf(stderr, "pid is still %d\n", (int)fc->pid);
+	return 0;
 }
 
 static void pid_from_ns(int sock, pid_t tpid)
@@ -1260,47 +1216,13 @@ int cg_write(const char *path, const char *buf, size_t size, off_t offset,
 	     struct fuse_file_info *fi)
 {
 	struct fuse_context *fc = fuse_get_context();
-	nih_local char *localbuf = NULL;
-	nih_local struct cgm_keys *k = NULL;
 	struct file_info *f = (struct file_info *)fi->fh;
+	nih_local struct cgm_keys *k = NULL;
 
-	if (f->type != LXC_TYPE_CGFILE) {
-		fprintf(stderr, "Internal error: directory cache info used in cg_write\n");
-		return -EIO;
-	}
-
-	if (offset)
-		return 0;
-
-	if (!fc)
-		return -EIO;
-
-	localbuf = NIH_MUST( nih_alloc(NULL, size+1) );
-	localbuf[size] = '\0';
-	memcpy(localbuf, buf, size);
-
-	if ((k = get_cgroup_key(f->controller, f->cgroup, f->file)) != NULL) {
-		bool r;
-
-		if (!fc_may_access(fc, f->controller, f->cgroup, f->file, O_WRONLY))
-			return -EACCES;
-
-		if (strcmp(f->file, "tasks") == 0 ||
-				strcmp(f->file, "/tasks") == 0 ||
-				strcmp(f->file, "/cgroup.procs") == 0 ||
-				strcmp(f->file, "cgroup.procs") == 0)
-			// special case - we have to translate the pids
-			r = do_write_pids(fc->pid, f->controller, f->cgroup, f->file, localbuf);
-		else
-			r = cgm_set_value(f->controller, f->cgroup, f->file, localbuf);
-
-		if (!r)
-			return -EINVAL;
-
-		return size;
-	}
-
-	return -EINVAL;
+	fprintf(stderr, "pid is %d\n", (int)fc->pid);
+	sleep(10);
+	fprintf(stderr, "pid is still %d\n", (int)fc->pid);
+	return 0;
 }
 
 int cg_chown(const char *path, uid_t uid, gid_t gid)
