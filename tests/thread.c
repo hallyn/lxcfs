@@ -38,18 +38,7 @@
 #define _GNU_SOURCE
 #include <getopt.h>
 
-#include <nih/alloc.h>
-#include <nih/string.h>
-#include <nih/error.h>
-
-#ifdef WITH_CGMANAGER
-#include <nih-dbus/dbus_connection.h>
-#include <nih-dbus/dbus_proxy.h>
-#include <cgmanager/cgmanager-client.h>
-#include "../cgmanager.h"
-// else use libgdbus
-#endif
-
+#include <dbus/dbus.h>
 #include "../config.h"
 
 /*
@@ -111,26 +100,66 @@ struct thread_args {
     const char *mode;
 };
 
-#ifdef WITH_CGMANAGER
-static __thread NihDBusProxy *cgroup_manager = NULL;
-static __thread int32_t api_version;
+static DBusConnection *connection;
+static int32_t api_version;
+
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static void lock_mutex(pthread_mutex_t *l)
+{
+	int ret;
+
+	if ((ret = pthread_mutex_lock(l)) != 0) {
+		fprintf(stderr, "pthread_mutex_lock returned:%d %s\n", ret, strerror(ret));
+		exit(1);
+	}
+}
+
+static void unlock_mutex(pthread_mutex_t *l)
+{
+	int ret;
+
+	if ((ret = pthread_mutex_unlock(l)) != 0) {
+		fprintf(stderr, "pthread_mutex_unlock returned:%d %s\n", ret, strerror(ret));
+		exit(1);
+	}
+}
+
+void lock(void) {
+	lock_mutex(&mutex);
+}
+void unlock(void) {
+	unlock_mutex(&mutex);
+}
+
+int refcount;
 
 static void cgm_dbus_disconnect(void)
 {
-       if (cgroup_manager) {
-	       dbus_connection_flush(cgroup_manager->connection);
-	       dbus_connection_close(cgroup_manager->connection);
-               nih_free(cgroup_manager);
-       }
-       cgroup_manager = NULL;
+	lock();
+	if (--refcount) {
+		unlock();
+		return;
+	}
+	if (connection) {
+		dbus_connection_flush(connection);
+		dbus_connection_close(connection);
+		dbus_connection_unref(connection);
+	}
+	connection = NULL;
+	unlock();
 }
 
 #define CGMANAGER_DBUS_SOCK "unix:path=/sys/fs/cgroup/cgmanager/sock"
 static bool cgm_dbus_connect(void)
 {
 	DBusError dbus_error;
-	static DBusConnection *connection;
 
+	lock();
+	if (connection) {
+		refcount++;
+		unlock();
+		return true;
+	}
 	dbus_error_init(&dbus_error);
 
 	connection = dbus_connection_open_private(CGMANAGER_DBUS_SOCK, &dbus_error);
@@ -138,32 +167,14 @@ static bool cgm_dbus_connect(void)
 		fprintf(stderr, "Failed opening dbus connection: %s: %s\n",
 				dbus_error.name, dbus_error.message);
 		dbus_error_free(&dbus_error);
+		unlock();
 		return false;
 	}
 	dbus_connection_set_exit_on_disconnect(connection, FALSE);
 	dbus_error_free(&dbus_error);
-	cgroup_manager = nih_dbus_proxy_new(NULL, connection,
-				NULL /* p2p */,
-				"/org/linuxcontainers/cgmanager", NULL, NULL);
-	dbus_connection_unref(connection);
-	if (!cgroup_manager) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "Error opening cgmanager proxy: %s\n", nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
+	refcount++;
+	unlock();
 
-	// get the api version
-	if (cgmanager_get_api_version_sync(NULL, cgroup_manager, &api_version) != 0) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "Error cgroup manager api version: %s\n", nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
 	return true;
 }
 
@@ -171,36 +182,77 @@ void do_getcg(void) {
 	char *output = NULL;
 	int r = 1;
 	void *retval = &r;
+	const char *controller = "freezer";
 
 	if (!cgm_dbus_connect()) {
 		fprintf(stderr, "exiting early\n");
 		pthread_exit(retval);
-		exit(1);
+		_exit(1);
 	}
 
-	if ( cgmanager_get_pid_cgroup_sync(NULL, cgroup_manager, "freezer", getpid(), &output) != 0 ) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to get_pid_cgroup (%s) failed: %s\n", "freezer", nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		fprintf(stderr, "exiting early\n");
+	DBusMessage *message = NULL, *reply = NULL;
+	DBusMessageIter iter;
+	message = dbus_message_new_method_call(dbus_bus_get_unique_name(connection),
+			"/org/linuxcontainers/cgmanager",
+			"org.linuxcontainers.cgmanager0_0", "GetPidCgroup");
+	dbus_message_iter_init_append(message, &iter);
+        if (! dbus_message_iter_append_basic (&iter, DBUS_TYPE_STRING,
+                                              &controller)) {
+		fprintf(stderr, "error appending controller to msg\n");
 		pthread_exit(retval);
-		exit(1);
+		_exit(1);
+        }
+
+	int32_t pid = getpid();
+        if (! dbus_message_iter_append_basic (&iter, DBUS_TYPE_INT32,
+                                              &pid)) {
+		fprintf(stderr, "error appending pid to msg\n");
+		pthread_exit(retval);
+		_exit(1);
+        }
+
+	DBusError dbus_error;
+	dbus_error_init(&dbus_error);
+
+	reply = dbus_connection_send_with_reply_and_block (connection, message, -1, &dbus_error);
+	if (! reply) {
+		dbus_message_unref (message);
+		fprintf(stderr, "dbus error: %s: %s\n", dbus_error.name, dbus_error.message);
+		dbus_error_free (&dbus_error);
+		pthread_exit(retval);
+		_exit(1);
 	}
+	dbus_message_unref (message);
+
+	dbus_message_iter_init(reply, &iter);
+	if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_STRING) {
+		dbus_message_unref(reply);
+		fprintf(stderr, "bad dbus reply\n");
+		pthread_exit(retval);
+		_exit(1);
+	}
+	const char *dbus_str;
+	dbus_message_iter_get_basic(&iter, &dbus_str);
+	output = malloc(strlen(dbus_str)+1);
+	if (!output) {
+		dbus_message_unref(reply);
+		fprintf(stderr, "out of memory\n");
+		pthread_exit(retval);
+		_exit(1);
+	}
+	strcpy(output, dbus_str);
+	dbus_message_unref(reply);
 
 	cgm_dbus_disconnect();
 	printf("I'm in %s\n", output);
-	nih_free(output);
+	free(output);
 }
-#endif
 
 static void do_function(void *arguments)
 {
     char name[NAME_MAX+1];
     struct thread_args *args = arguments;
     struct lxc_container *c;
-    printf("Would run, thread %d\n", args->thread_id);
 
     if (strcmp(args->mode, "getcg") == 0) {
 	    do_getcg();
@@ -215,28 +267,15 @@ static void *concurrent(void *arguments)
     return NULL;
 }
 
-bool detect_libnih_threadsafe(void)
-{
-#ifdef HAVE_NIH_THREADSAFE
-	if (nih_threadsafe())
-		return true;
-#endif
-	return false;
-}
-
 int main(int argc, char *argv[]) {
     int i, j, iter, opt;
     pthread_attr_t attr;
     pthread_t *threads;
     struct thread_args *args;
 
-    char *modes_default[] = {"create", "movepid", "getcg"};
+    //char *modes_default[] = {"create", "movepid", "getcg"};
+    char *modes_default[] = {"getcg"};
     char **modes = modes_default;
-
-    if (!detect_libnih_threadsafe()) {
-        fprintf(stderr, "libnih is not compiled with safe threading.\n");
-        exit(1);
-    }
 
     pthread_attr_init(&attr);
 
