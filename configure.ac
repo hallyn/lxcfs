@@ -31,6 +31,9 @@ AC_CHECK_LIB(cgmanager, cgmanager_list_keys_sync, [], AC_MSG_ERROR(["cgmanager 0
 AC_CHECK_LIB(nih, nih_alloc)
 AC_CHECK_FUNCS(nih_threadsafe, , , libnih)
 
+AC_CHECK_LIB(nih, nih_alloc)
+AC_CHECK_FUNCS(nih_threadsafe, , , libnih)
+
 AC_PATH_PROG(HELP2MAN, help2man, false // No help2man //)
 AM_CONDITIONAL([HAVE_HELP2MAN], [test "x$HELP2MAN" != "xfalse // No help2man //" ])
 
