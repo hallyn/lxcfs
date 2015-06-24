@@ -230,7 +230,7 @@ int main(int argc, char *argv[]) {
     pthread_t *threads;
     struct thread_args *args;
 
-    char *modes_default[] = {"create", "movepid", "getcg"};
+    char *modes_default[] = {"create", "movepid", "getcg", NULL};
     char **modes = modes_default;
 
     if (!detect_libnih_threadsafe()) {
