@@ -30,7 +30,7 @@ TEST_READ: tests/test-read.c
 
 CGM_TEST_FLAGS = $(DBUS_CFLAGS) $(NIH_CFLAGS) $(NIH_DBUS_CFLAGS) $(CGMANAGER_CFLAGS) $(DBUS_LIBS) $(NIH_LIBS) $(NIH_DBUS_LIBS) $(CGMANAGER_LIBS) -lpthread
 TEST_THREAD_CGM: tests/thread.c
-	$(CC) -o tests/test-thread tests/thread.c -DWITH_CGMANAGER ${CGM_TEST_FLAGS}
+	$(CC) -g -o tests/test-thread tests/thread.c -DWITH_CGMANAGER ${CGM_TEST_FLAGS}
 
 #TEST_THREAD_GDBUS: tests/test-thread.c
 #	$(CC) -o tests/test-thread tests/test-thread.c
