@@ -113,83 +113,172 @@ static bool cgm_dbus_connect(void)
 	return true;
 }
 
+static bool cgcall(const gchar *method_name, GVariant *parameters,
+		const GVariantType *reply_type, GVariant **reply)
+{
+	GVariant *my_reply = NULL;
+	if (!cgm_dbus_connect())
+		return false;
+	if (!reply)
+		reply = &my_reply;
+	/* We do this sync because we need to ensure that the calls finish
+	 * before we return to _our_ caller saying that this is done.
+	 */
+	*reply = g_dbus_connection_call_sync (connection, NULL, "/org/linuxcontainers/cgmanager",
+			"org.linuxcontainers.cgmanager0_0", method_name,
+			parameters, reply_type, G_DBUS_CALL_FLAGS_NONE,
+			-1, NULL, &error);
+	if (!*reply)
+	{
+		if (reply_type)
+			g_warning ("cgmanager method call org.linuxcontainers.cgmanager0_0.%s failed: %s.  "
+					"Use G_DBUS_DEBUG=message for more info.", method_name, error->message);
+		g_error_free (error);
+		return false;
+	}
+	if (my_reply)
+		g_variant_unref (my_reply);
+	return true;
+}
+
+// todo - can we avoid some of this alloc/copy/free when copying
+// from iters?
+
+#define MAX_CONTROLLERS 20
 bool cgm_get_controllers(char ***contrls)
 {
-	if (!cgm_dbus_connect()) {
-		return false;
-	}
+	char **list = NULL;
+	GVariantIter *iter = NULL;
+	GVariant *reply = NULL;
+	gchar *ctrl;
+	int i = 0;
 
-	if ( cgmanager_list_controllers_sync(NULL, cgroup_manager, contrls) != 0 ) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to list_controllers failed: %s\n", nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
+	if (!cgcall("ListControllers", G_VARIANT_TYPE_UNIT, G_VARIANT_TYPE("(as)", &reply)))
 		return false;
-	}
 
-	cgm_dbus_disconnect();
+	do {
+		list = malloc(MAX_CONTROLLERS * sizeof(*list));
+	} while (!list);
+	memset(list, 0, MAX_CONTROLLERS * sizeof(*list));
+	g_variant_get(reply, "(as)", &iter);
+	while (g_variant_iter_next(iter, "s", &ctrl)) {
+		if (i >= MAX_CONTROLLERS) {
+			g_warning("Too many cgroup subsystems");
+			exit(1);
+		}
+		do {
+			list[i] = strdup(ctrl);
+		} while (!list[i]);
+		i++;
+		g_free(ctrl);
+	}
+	g_variant_iter_free(iter);
+	g_variant_unref(reply);
+
+	*contrls = list;
 	return true;
+}
+
+void free_key(struct cgm_keys *k)
+{
+	if (!k)
+		return;
+	free(k->name);
+	free(k);
+}
+
+void free_keys(struct cgm_keys **keys)
+{
+	int i;
+
+	if (!keys)
+		return;
+	for (i = 0; keys[i]; i++) {
+		free_key(keys[i];
+	}
+	free(keys);
+}
+
+#define BATCH_SIZE 10
+void append_key(struct cgm_keys ***keys, struct cgm_keys *newk, size_t *sz, size_t *asz)
+{
+	struct cgm_keys **tmp;
+	assert(keys);
+	if (sz == 0) {
+		*asz = BATCH_SIZE;
+		*sz = 1;
+		do {
+			*keys = malloc(*asz * sizeof(struct cgm_keys *));
+		} while (!*keys);
+		memset(*keys, 0, *asz * sizeof(struct cgm_keys *));
+		(*keys)[0] = newk;
+		return;
+	}
+	if (*sz + 2 >= *asz) {
+		*asz += BATCH_SIZE;
+		do {
+			tmp = realloc(*keys, *asz * sizeof(struct cgm_keys *));
+		} while (!*keys);
+		*keys = tmp;
+	}
+	(*keys)[(*sz)++] = newk;
+	(*keys)[(*sz)] = NULL;
 }
 
 bool cgm_list_keys(const char *controller, const char *cgroup, struct cgm_keys ***keys)
 {
-	if (!cgm_dbus_connect()) {
+	size_t used = 0, alloced = 0;
+	GVariantIter *iter = NULL;
+	GVariant *reply = NULL;
+	size_t sz = 0, asz = 0;
+
+	if (!cgcall("ListKeys", g_variant_new("(ss)", controller, cgroup),
+			G_VARIANT_TYPE("a(suuu)", &reply)))
 		return false;
+
+	g_variant_get(reply, "(suuu)", &iter);
+	while (g_variant_iter_next(iter, "suuu", &name, &uid, &gid, &perms)) {
+		/* name, owner, groupid, perms) */
+		gchar *name;
+		GVariant *uid, *gid, *perms;
+		struct cgm_key *k;
+
+		do {
+			k = malloc(sizeof(*k));
+		} while (!k);
+		do {
+			k->name = strdup(name);
+		} while (!k->name);
+		k->uid = g_variant_get_int32(uid);
+		k->gid = g_variant_get_int32(gid);
+		k->perms = g_variant_get_int32(perms);
+		g_variant_unref(uid);
+		g_variant_unref(gid);
+		g_variant_unref(perms);
+		g_free(name);
+		append_key(keys, k, sz, asz);
 	}
 
-	if ( cgmanager_list_keys_sync(NULL, cgroup_manager, controller, cgroup,
-				(CgmanagerListKeysOutputElement ***)keys) != 0 ) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to list_keys (%s:%s) failed: %s\n", controller, cgroup, nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
+	g_variant_iter_free(iter);
+	g_variant_unref(reply);
 
-	cgm_dbus_disconnect();
 	return true;
 }
 
 bool cgm_list_children(const char *controller, const char *cgroup, char ***list)
 {
-	if (!cgm_dbus_connect()) {
+	if (!cgcall("ListChildren", g_variant_new("(ss)", controller, cgroup),
+			G_VARIANT_TYPE("as"), &reply))
 		return false;
-	}
-
-	if ( cgmanager_list_children_sync(NULL, cgroup_manager, controller, cgroup, list) != 0 ) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to list_children (%s:%s) failed: %s\n", controller, cgroup, nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
-
-	cgm_dbus_disconnect();
-	return true;
 }
 
 char *cgm_get_pid_cgroup(pid_t pid, const char *controller)
 {
 	char *output = NULL;
 
-	if (!cgm_dbus_connect()) {
+	if (!cgcall("GetPidCgroup", g_variant_new("(si)", controller, (uint32)pid),
+				G_VARIANT_TYPE("(s)", &reply)))
 		return NULL;
-	}
-
-	if ( cgmanager_get_pid_cgroup_sync(NULL, cgroup_manager, controller, pid, &output) != 0 ) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to get_pid_cgroup (%s) failed: %s\n", controller, nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return NULL;
-	}
-
-	cgm_dbus_disconnect();
-	return output;
 }
 
 bool cgm_escape_cgroup(void)

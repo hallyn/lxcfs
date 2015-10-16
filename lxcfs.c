@@ -1700,7 +1700,7 @@ static void get_blkio_io_value(char *str, unsigned major, unsigned minor, char *
 
 static char *get_pid_cgroup(pid_t pid, const char *contrl)
 {
-	char *fnam[PROCLEN];
+	char fnam[PROCLEN];
 	FILE *f;
 	char *answer = NULL;
 	char *line = NULL;
