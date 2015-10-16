@@ -3,6 +3,8 @@ struct cgm_keys {
 	uint32_t uid, gid;
 	uint32_t mode;
 };
+void free_key(struct cgm_keys *k);
+void free_keys(struct cgm_keys **keys);
 
 bool cgm_get_controllers(char ***contrls);
 bool cgm_list_keys(const char *controller, const char *cgroup, struct cgm_keys ***keys);
@@ -19,3 +21,6 @@ bool cgm_remove(const char *controller, const char *cg);
 
 bool cgm_escape_cgroup(void);
 bool cgm_move_pid(const char *controller, const char *cgroup, pid_t pid);
+
+void cgm_dbus_disconnect(void);
+bool cgm_dbus_connect(void);
