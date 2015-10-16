@@ -1,12 +1,8 @@
 /*
- * lxc: linux Container library
- *
- * (C) Copyright IBM Corp. 2007, 2008
- * (C) Copyright Canonical, Inc, 2014
+ * Copyright © 2015 Canonical Limited
  *
  * Authors:
- * Daniel Lezcano <daniel.lezcano at free.fr>
- * Serge Hallyn <serge.hallyn@ubuntu.com>
+ *   Serge Hallyn <serge.hallyn@ubuntu.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -44,66 +40,76 @@
 #include <net/if.h>
 #include <stdbool.h>
 
-#include <nih-dbus/dbus_connection.h>
-#include <cgmanager/cgmanager-client.h>
-#include <nih/alloc.h>
-#include <nih/error.h>
-#include <nih/string.h>
+#include <glib.h>
+#include <gio/gio.h>
 
-#include "cgmanager.h"
+#define CGM_DBUS_ADDRESS          "unix:path=/sys/fs/cgroup/cgmanager/sock"
+#define CGM_REQUIRED_VERSION      9  // we need list_keys
 
-static __thread NihDBusProxy *cgroup_manager = NULL;
-static __thread int32_t api_version;
+static __thread GDBusConnection *cgroup_manager = NULL;
 
-static void cgm_dbus_disconnect(void)
+static void cgm_dbus_disconnect(void *)
 {
+       GError *error = NULL;
+
        if (cgroup_manager) {
-	       dbus_connection_flush(cgroup_manager->connection);
-	       dbus_connection_close(cgroup_manager->connection);
-               nih_free(cgroup_manager);
+	       if (!g_dbus_connection_flush_sync(cgroup_manager, NULL, &error)) {
+		       g_warning("failed to flush connection: %s."
+		           "Use G_DBUS_DEBUG=message for more info.", error->message);
+		       g_error_free(error);
+	       }
+	       if (!g_dbus_connection_close(cgroup_manager, NULL)) {
+		       g_warning("failed to close connection: %s."
+		           "Use G_DBUS_DEBUG=message for more info.", error->message);
+		       g_error_free(error);
+	       }
        }
        cgroup_manager = NULL;
 }
 
-#define CGMANAGER_DBUS_SOCK "unix:path=/sys/fs/cgroup/cgmanager/sock"
 static bool cgm_dbus_connect(void)
 {
-	DBusError dbus_error;
-	static DBusConnection *connection;
+	GDBusConnection *connection;
+	GVariant *reply;
+	GVariant *version;
+	GError *error = NULL;
 
-	dbus_error_init(&dbus_error);
+	if (cgroup_manager)
+		return true;
 
-	connection = dbus_connection_open_private(CGMANAGER_DBUS_SOCK, &dbus_error);
+	connection = g_dbus_connection_new_for_address_sync (CGM_DBUS_ADDRESS,
+			G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT,
+			NULL, NULL, &error);
 	if (!connection) {
-		fprintf(stderr, "Failed opening dbus connection: %s: %s\n",
-				dbus_error.name, dbus_error.message);
-		dbus_error_free(&dbus_error);
+		g_warning("Could not connect to cgmanager: %s\n"
+			"Use G_DBUS_DEBUG=message for more info.", error->message);
+		g_error_free(error);
 		return false;
-	}
-	dbus_connection_set_exit_on_disconnect(connection, FALSE);
-	dbus_error_free(&dbus_error);
-	cgroup_manager = nih_dbus_proxy_new(NULL, connection,
-				NULL /* p2p */,
-				"/org/linuxcontainers/cgmanager", NULL, NULL);
-	dbus_connection_unref(connection);
-	if (!cgroup_manager) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "Error opening cgmanager proxy: %s\n", nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
 
-	// get the api version
-	if (cgmanager_get_api_version_sync(NULL, cgroup_manager, &api_version) != 0) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "Error cgroup manager api version: %s\n", nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
+	reply = g_dbus_connection_call_sync (connection, NULL, "/org/linuxcontainers/cgmanager",
+			"org.freedesktop.DBus.Properties", "Get",
+			g_variant_new ("(ss)", "org.linuxcontainers.cgmanager0_0", "api_version"),
+			G_VARIANT_TYPE ("(v)"), G_DBUS_CALL_FLAGS_NONE, -1, NULL, error);
+	if (!reply)
+	{
+		g_warning("Failed to get cgmanager api version: %s\n"
+			"Use G_DBUS_DEBUG=message for more info.", error->message);
+		g_error_free(error);
+		g_object_unref (connection);
 		return false;
 	}
+	g_variant_get (reply, "(v)", &version);
+	g_variant_unref (reply);
+	if (!g_variant_is_of_type (version, G_VARIANT_TYPE_INT32) || g_variant_get_int32 (version) < CGM_REQUIRED_VERSION)
+	{
+		g_warning("Cgmanager does not meet minimal API version");
+		g_object_unref (connection);
+		g_variant_unref (version);
+		return false;
+	}
+	g_variant_unref (version);
+	pthread_cleanup_push(cgm_dbus_disconnect, NULL);
+
 	return true;
 }
 
@@ -188,41 +194,14 @@ char *cgm_get_pid_cgroup(pid_t pid, const char *controller)
 
 bool cgm_escape_cgroup(void)
 {
-	if (!cgm_dbus_connect()) {
-		return false;
-	}
-
-	if ( cgmanager_move_pid_abs_sync(NULL, cgroup_manager, "all", "/", (int32_t) getpid()) != 0 ) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to move_pid_abs (all:/) failed: %s\n", nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
-
-	cgm_dbus_disconnect();
-	return true;
+	return cgcall("MovePidAbs", g_variant_new("(ssi)", "all", "/", getpid()),
+			G_VARIANT_TYPE_UNIT, NULL);
 }
 
 bool cgm_move_pid(const char *controller, const char *cgroup, pid_t pid)
 {
-	if (!cgm_dbus_connect()) {
-		return false;
-	}
-
-	if ( cgmanager_move_pid_sync(NULL, cgroup_manager, controller, cgroup,
-				(int32_t) pid) != 0 ) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to move_pid (%s:%s, %d) failed: %s\n", controller, cgroup, pid, nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
-
-	cgm_dbus_disconnect();
-	return true;
+	return cgcall("MovePid", g_variant_new("(ssi)", controller, cgroup, pid),
+			G_VARIANT_TYPE_UNIT, NULL);
 }
 
 bool cgm_get_value(const char *controller, const char *cgroup, const char *file,
@@ -249,22 +228,8 @@ bool cgm_get_value(const char *controller, const char *cgroup, const char *file,
 bool cgm_set_value(const char *controller, const char *cgroup, const char *file,
 		const char *value)
 {
-	if (!cgm_dbus_connect()) {
-		return false;
-	}
-
-	if ( cgmanager_set_value_sync(NULL, cgroup_manager, controller, cgroup,
-			file, value) != 0 ) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to set_value (%s:%s, %s, %s) failed: %s\n", controller, cgroup, file, value, nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
-
-	cgm_dbus_disconnect();
-	return true;
+	return cgcall("SetValue", g_variant_new("(ssss)", controller, cgroup, file, value),
+			G_VARIANT_TYPE_UNIT, NULL);
 }
 
 static int wait_for_pid(pid_t pid)
@@ -303,82 +268,27 @@ bool cgm_create(const char *controller, const char *cg, uid_t uid, gid_t gid)
 	if (setresuid(uid, uid, uid))
 		_exit(1);
 
-	if (!cgm_dbus_connect()) {
+	if (!cgcall("Create", g_variant_new("(ss)", controller, cg),
+				G_VARIANT_TYPE ("(i)"), NULL))
 		_exit(1);
-	}
 
-	if ( cgmanager_create_sync(NULL, cgroup_manager, controller, cg, &e) != 0) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to create failed (%s:%s): %s\n", controller, cg, nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		_exit(1);
-	}
-
-	cgm_dbus_disconnect();
 	_exit(0);
 }
 
 bool cgm_chown_file(const char *controller, const char *cg, uid_t uid, gid_t gid)
 {
-	if (!cgm_dbus_connect()) {
-		return false;
-	}
-
-	if ( cgmanager_chown_sync(NULL, cgroup_manager, controller, cg, uid, gid) != 0) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to chown (%s:%s, %d, %d) failed: %s\n", controller, cg, uid, gid, nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
-
-	cgm_dbus_disconnect();
-	return true;
+	return cgcall("Chown", g_variant_new("(ssii)", controller, cg, uid, gid),
+			G_VARIANT_TYPE_UNIT, NULL);
 }
 
 bool cgm_chmod_file(const char *controller, const char *file, mode_t mode)
 {
-	if (!cgm_dbus_connect()) {
-		return false;
-	}
-
-	if ( cgmanager_chmod_sync(NULL, cgroup_manager, controller, file, "", mode) != 0) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to chmod (%s:%s, %d) failed: %s\n", controller, file, mode, nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
-
-	cgm_dbus_disconnect();
-	return true;
+	return cgcall("Chmod", g_variant_new("(sssi)", controller, file, "", mode), G_VARIANT_TYPE_UNIT, NULL);
 }
 
 bool cgm_remove(const char *controller, const char *cg)
 {
-	/*
-	 * tempting to make remove be recursive, but this is a filesystem,
-	 * so best to opt for least surprise
-	 */
 	int32_t r = 0, e;
 
-	if (!cgm_dbus_connect()) {
-		return false;
-	}
-
-	if ( cgmanager_remove_sync(NULL, cgroup_manager, controller, cg, r, &e) != 0) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to remove (%s:%s) failed: %s\n", controller, cg, nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
-
-	cgm_dbus_disconnect();
-	return true;
+	return cgcall("Remove", g_variant_new ("(ssi)", "all", path, 1), G_VARIANT_TYPE ("(i)"), NULL);
 }
