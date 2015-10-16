@@ -25,17 +25,12 @@
 #include <sys/mount.h>
 #include <wait.h>
 
-#include <nih-dbus/dbus_connection.h>
-#include <nih/alloc.h>
-#include <nih/string.h>
-#include <nih/error.h>
-
 #include "cgmanager.h"
 #include "config.h" // for VERSION
 
 struct lxcfs_state {
 	/*
-	 * a null-terminated, nih-allocated list of the mounted subsystems.  We
+	 * a null-terminated list of the mounted subsystems.  We
 	 * detect this at startup.
 	 */
 	char **subsystems;
@@ -65,11 +60,46 @@ struct file_info {
 /* reserve buffer size, for cpuall in /proc/stat */
 #define BUF_RESERVE_SIZE 256
 
+/*
+ * append pid to *src.
+ * src: a pointer to a char* in which ot append the pid.
+ * sz: the number of characters printed so far, minus trailing \0.
+ * asz: the allocated size so far
+ * pid: the pid to append
+ */
+static void must_strcat_pid(char **src, size_t *sz, size_t *asz, pid_t pid)
+{
+	char *d = *src;
+	char tmp[30];
+
+	sprintf(tmp, "%d\n", (int)pid);
+
+	if (!d) {
+		do {
+			d = malloc(BUF_RESERVE_SIZE);
+		} while (!d);
+		*src = d;
+		*asz = BUF_RESERVE_SIZE;
+	} else if (strlen(tmp) + sz + 1 >= asz) {
+		do {
+			d = realloc(d, *asz + BUF_RESERVE_SIZE);
+		} while (!d);
+		*src = d;
+		*asz += BUF_RESERVE_SIZE;
+	}
+	memcpy(d+*sz, tmp, strlen(tmp));
+	*sz += strlen(tmp);
+	d[*sz] = '\0';
+}
+
 static char *must_copy_string(void *parent, const char *str)
 {
+	char *dup = NULL;
 	if (!str)
 		return NULL;
-	return NIH_MUST( nih_strdup(parent, str) );
+	do {
+		dup = strdup(str);
+	} while (!dup);
 }
 
 /*
@@ -146,9 +176,12 @@ convert_id_to_ns(FILE *idfile, unsigned int in_id)
 #define NS_ROOT_REQD true
 #define NS_ROOT_OPT false
 
+#define PROCLEN 100
+
 static bool is_privileged_over(pid_t pid, uid_t uid, uid_t victim, bool req_ns_root)
 {
-	nih_local char *fpath = NULL;
+	char fpath[PROCLEN];
+	int ret;
 	bool answer = false;
 	uid_t nsuid;
 
@@ -163,7 +196,9 @@ static bool is_privileged_over(pid_t pid, uid_t uid, uid_t victim, bool req_ns_r
 	if (!req_ns_root && uid == victim)
 		return true;
 
-	fpath = NIH_MUST( nih_sprintf(NULL, "/proc/%d/uid_map", pid) );
+	ret = snprintf(fpath, PROCLEN, "/proc/%d/uid_map", pid);
+	if (ret < 0 || ret >= PROCLEN)
+		return false;
 	FILE *f = fopen(fpath, "r");
 	if (!f)
 		return false;
@@ -219,9 +254,11 @@ static char *get_next_cgroup_dir(const char *taskcg, const char *querycg)
 	}
 
 	if (strcmp(querycg, "/") == 0)
-		start = NIH_MUST( nih_strdup(NULL, taskcg + 1) );
+		start =  strdup(taskcg + 1);
 	else
-		start = NIH_MUST( nih_strdup(NULL, taskcg + strlen(querycg) + 1) );
+		start = strdup(taskcg + strlen(querycg) + 1);
+	if (!start)
+		return NULL;
 	end = strchr(start, '/');
 	if (end)
 		*end = '\0';
@@ -241,7 +278,8 @@ static char *get_next_cgroup_dir(const char *taskcg, const char *querycg)
  */
 static bool fc_may_access(struct fuse_context *fc, const char *contrl, const char *cg, const char *file, mode_t mode)
 {
-	nih_local struct cgm_keys **list = NULL;
+	struct cgm_keys **list = NULL;
+	bool ret = false;
 	int i;
 
 	if (!file)
@@ -256,18 +294,24 @@ static bool fc_may_access(struct fuse_context *fc, const char *contrl, const cha
 		if (strcmp(list[i]->name, file) == 0) {
 			struct cgm_keys *k = list[i];
 			if (is_privileged_over(fc->pid, fc->uid, k->uid, NS_ROOT_OPT)) {
-				if (perms_include(k->mode >> 6, mode))
-					return true;
+				if (perms_include(k->mode >> 6, mode)) {
+					ret = true;
+					goto out;
+				}
 			}
 			if (fc->gid == k->gid) {
-				if (perms_include(k->mode >> 3, mode))
-					return true;
+				if (perms_include(k->mode >> 3, mode)) {
+					ret = true;
+					goto out;
+				}
 			}
 			return perms_include(k->mode, mode);
 		}
 	}
 
-	return false;
+out:
+	free_keys(list);
+	return ret;
 }
 
 static void stripnewline(char *x)
@@ -296,17 +340,21 @@ static void prune_init_slice(char *cg)
  * If caller is in /a/b/c/d, he may only act on things under cg=/a/b/c/d.
  * If caller is in /a, he may act on /a/b, but not on /b.
  * if the answer is false and nextcg is not NULL, then *nextcg will point
- * to a nih_alloc'd string containing the next cgroup directory under cg
+ * to a string containing the next cgroup directory under cg, which must be
+ * freed by the caller.
  */
 static bool caller_is_in_ancestor(pid_t pid, const char *contrl, const char *cg, char **nextcg)
 {
-	nih_local char *fnam = NULL;
+	char fnam[PROCLEN];
 	FILE *f;
 	bool answer = false;
 	char *line = NULL;
 	size_t len = 0;
+	int ret;
 
-	fnam = NIH_MUST( nih_sprintf(NULL, "/proc/%d/cgroup", pid) );
+	ret = snprintf(fnam, PROCLEN, "/proc/%d/cgroup", pid);
+	if (ret < 0 || ret >= PROCLEN)
+		return false;
 	if (!(f = fopen(fnam, "r")))
 		return false;
 
@@ -348,38 +396,35 @@ out:
 }
 
 /*
- * given /cgroup/freezer/a/b, return "freezer".  this will be nih-allocated
- * and needs to be nih_freed.
+ * given /cgroup/freezer/a/b, return "freezer".
+ * the returned char* should NOT be freed.
  */
 static char *pick_controller_from_path(struct fuse_context *fc, const char *path)
 {
 	const char *p1;
-	char *ret, *slash;
+	char *contr, *slash;
 
 	if (strlen(path) < 9)
 		return NULL;
 	if (*(path+7) != '/')
 		return NULL;
 	p1 = path+8;
-	ret = nih_strdup(NULL, p1);
-	if (!ret)
-		return ret;
-	slash = strstr(ret, "/");
+	contr = strdupa(p1);
+	if (!contr)
+		return NULL;
+	slash = strstr(contr, "/");
 	if (slash)
 		*slash = '\0';
 
 	/* verify that it is a subsystem */
 	char **list = LXCFS_DATA ? LXCFS_DATA->subsystems : NULL;
 	int i;
-	if (!list) {
-		nih_free(ret);
+	if (!list)
 		return NULL;
-	}
 	for (i = 0;  list[i];  i++) {
-		if (strcmp(list[i], ret) == 0)
-			return ret;
+		if (strcmp(list[i], contr) == 0)
+			return list[i];
 	}
-	nih_free(ret);
 	return NULL;
 }
 
@@ -401,7 +446,8 @@ static const char *find_cgroup_in_path(const char *path)
 
 static bool is_child_cgroup(const char *contr, const char *dir, const char *f)
 {
-	nih_local char **list = NULL;
+	char **list;
+	bool ret = false;
 	int i;
 
 	if (!f)
@@ -412,17 +458,23 @@ static bool is_child_cgroup(const char *contr, const char *dir, const char *f)
 	if (!cgm_list_children(contr, dir, &list))
 		return false;
 	for (i = 0; list[i]; i++) {
-		if (strcmp(list[i], f) == 0)
-			return true;
+		if (strcmp(list[i], f) == 0) {
+			ret = true;
+			goto out;
+		}
 	}
 
-	return false;
+out:
+	for (i = 0; list[i]; i++)
+		free(list[i]);
+	free(list);
+	return ret;
 }
 
 static struct cgm_keys *get_cgroup_key(const char *contr, const char *dir, const char *f)
 {
-	nih_local struct cgm_keys **list = NULL;
-	struct cgm_keys *k;
+	struct cgm_keys **list = NULL;
+	struct cgm_keys *k = NULL;
 	int i;
 
 	if (!f)
@@ -433,23 +485,31 @@ static struct cgm_keys *get_cgroup_key(const char *contr, const char *dir, const
 		return NULL;
 	for (i = 0; list[i]; i++) {
 		if (strcmp(list[i]->name, f) == 0) {
-			k = NIH_MUST( nih_alloc(NULL, (sizeof(*k))) );
-			k->name = NIH_MUST( nih_strdup(k, list[i]->name) );
-			k->uid = list[i]->uid;
-			k->gid = list[i]->gid;
-			k->mode = list[i]->mode;
+			int j;
+			k = list[i];
+			for (j = 0; list[j]; j++) {
+				if (i != j)
+					free(list[j]);
+			}
+			free(list);
 			return k;
 		}
 	}
 
+	free_keys(list);
 	return NULL;
 }
 
+/*
+ * dir should be freed, file not
+ */
 static void get_cgdir_and_path(const char *cg, char **dir, char **file)
 {
 	char *p;
 
-	*dir = NIH_MUST( nih_strdup(NULL, cg) );
+	do {
+		*dir = strdup(cg);
+	} while (!*dir);
 	*file = strrchr(cg, '/');
 	if (!*file) {
 		*file = NULL;
@@ -467,11 +527,12 @@ static int cg_getattr(const char *path, struct stat *sb)
 {
 	struct timespec now;
 	struct fuse_context *fc = fuse_get_context();
-	nih_local char * cgdir = NULL;
+	char * cgdir = NULL;
 	char *fpath = NULL, *path1, *path2;
-	nih_local struct cgm_keys *k = NULL;
+	struct cgm_keys *k = NULL;
 	const char *cgroup;
-	nih_local char *controller = NULL;
+	char *controller = NULL;
+	int ret = -ENOENT;
 
 
 	if (!fc)
@@ -522,10 +583,12 @@ static int cg_getattr(const char *path, struct stat *sb)
 			/* this is just /cgroup/controller, return it as a dir */
 			sb->st_mode = S_IFDIR | 00555;
 			sb->st_nlink = 2;
-			return 0;
+			ret = 0;
+			goto out;
 		}
-		if (!fc_may_access(fc, controller, cgroup, NULL, O_RDONLY))
-			return -EACCES;
+		if (!fc_may_access(fc, controller, cgroup, NULL, O_RDONLY)) {
+			ret = -EACCES;
+			goto out;
 
 		// get uid, gid, from '/tasks' file and make up a mode
 		// That is a hack, until cgmanager gains a GetCgroupPerms fn.
@@ -538,7 +601,8 @@ static int cg_getattr(const char *path, struct stat *sb)
 			sb->st_gid = k->gid;
 		}
 		sb->st_nlink = 2;
-		return 0;
+		ret = 0;
+		goto out;
 	}
 
 	if ((k = get_cgroup_key(controller, path1, path2)) != NULL) {
@@ -552,10 +616,13 @@ static int cg_getattr(const char *path, struct stat *sb)
 		sb->st_uid = k->uid;
 		sb->st_gid = k->gid;
 		sb->st_size = 0;
-		return 0;
+		ret = 0;
 	}
 
-	return -ENOENT;
+out:
+	free_key(k);
+	free(cgdir);
+	return ret;
 }
 
 /*
@@ -565,10 +632,9 @@ static int cg_getattr(const char *path, struct stat *sb)
 static int cg_opendir(const char *path, struct fuse_file_info *fi)
 {
 	struct fuse_context *fc = fuse_get_context();
-	nih_local struct cgm_keys **list = NULL;
 	const char *cgroup;
 	struct file_info *dir_info;
-	nih_local char *controller = NULL;
+	char *controller = NULL;
 
 	if (!fc)
 		return -EIO;
@@ -593,7 +659,9 @@ static int cg_opendir(const char *path, struct fuse_file_info *fi)
 		return -EACCES;
 
 	/* we'll free this at cg_releasedir */
-	dir_info = NIH_MUST( nih_alloc(NULL, sizeof(*dir_info)) );
+	dir_info = malloc(sizeof(*dir_info));
+	if (!dir_info)
+		return -ENOMEM;
 	dir_info->controller = must_copy_string(dir_info, controller);
 	dir_info->cgroup = must_copy_string(dir_info, cgroup);
 	dir_info->type = LXC_TYPE_CGDIR;
@@ -609,10 +677,11 @@ static int cg_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 		struct fuse_file_info *fi)
 {
 	struct file_info *d = (struct file_info *)fi->fh;
-	nih_local struct cgm_keys **list = NULL;
+	struct cgm_keys **list = NULL;
 	int i;
-	nih_local char *nextcg = NULL;
+	char *nextcg = NULL;
 	struct fuse_context *fc = fuse_get_context();
+	char **clist = NULL;
 
 	if (d->type != LXC_TYPE_CGDIR) {
 		fprintf(stderr, "Internal error: file cache info used in readdir\n");
@@ -642,38 +711,53 @@ static int cg_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 		if (nextcg) {
 			int ret;
 			ret = filler(buf, nextcg,  NULL, 0);
-			if (ret != 0)
-				return -EIO;
+			free(nextcg);
+			if (ret != 0) {
+				ret = -EIO;
+				goto out;
+			}
 		}
-		return 0;
+		ret = 0;
+		goto out;
 	}
 
 	for (i = 0; list[i]; i++) {
 		if (filler(buf, list[i]->name, NULL, 0) != 0) {
-			return -EIO;
+			ret = -EIO;
+			goto out;
 		}
 	}
 
 	// now get the list of child cgroups
-	nih_local char **clist = NULL;
 
-	if (!cgm_list_children(d->controller, d->cgroup, &clist))
-		return 0;
+	if (!cgm_list_children(d->controller, d->cgroup, &clist)) {
+		ret = 0;
+		goto out;
+	}
 	for (i = 0; clist[i]; i++) {
 		if (filler(buf, clist[i], NULL, 0) != 0) {
-			return -EIO;
+			ret = -EIO;
+			goto out;
 		}
 	}
-	return 0;
+	ret = 0;
+
+out:
+	free_keys(list);
+	if (clist) {
+		for (i = 0; clist[i]; i++)
+			free(clist[i]);
+		free(clist);
+	}
+	return ret;
 }
 
 static void do_release_file_info(struct file_info *f)
 {
-	/*
-	 * all file_info fields which are nih_alloc()d with f as parent
-	 * will be automatically freed
-	 */
-	nih_free(f);
+	free(f->controller);
+	free(f->cgroup);
+	free(f->file);
+	free(f->buf);
 }
 
 static int cg_releasedir(const char *path, struct fuse_file_info *fi)
@@ -686,13 +770,12 @@ static int cg_releasedir(const char *path, struct fuse_file_info *fi)
 
 static int cg_open(const char *path, struct fuse_file_info *fi)
 {
-	nih_local char *controller = NULL;
 	const char *cgroup;
-	char *fpath = NULL, *path1, *path2;
-	nih_local char * cgdir = NULL;
-	nih_local struct cgm_keys *k = NULL;
+	char *fpath = NULL, *path1, *path2, * cgdir = NULL, *controller;
+	struct cgm_keys *k = NULL;
 	struct file_info *file_info;
 	struct fuse_context *fc = fuse_get_context();
+	int ret;
 
 	if (!fc)
 		return -EIO;
@@ -714,15 +797,23 @@ static int cg_open(const char *path, struct fuse_file_info *fi)
 	}
 
 	k = get_cgroup_key(controller, path1, path2);
-	if (!k)
-		return -EINVAL;
+	if (!k) {
+		ret = -EINVAL;
+		goto out;
+	}
 
-	if (!fc_may_access(fc, controller, path1, path2, fi->flags))
+	if (!fc_may_access(fc, controller, path1, path2, fi->flags)) {
 		// should never get here
-		return -EACCES;
+		ret = -EACCES;
+		goto out;
+	}
 
 	/* we'll free this at cg_release */
-	file_info = NIH_MUST( nih_alloc(NULL, sizeof(*file_info)) );
+	file_info = malloc(sizeof(*file_info));
+	if (!file_info) {
+		ret = -ENOMEM;
+		goto out;
+	}
 	file_info->controller = must_copy_string(file_info, controller);
 	file_info->cgroup = must_copy_string(file_info, path1);
 	file_info->file = must_copy_string(file_info, path2);
@@ -731,7 +822,12 @@ static int cg_open(const char *path, struct fuse_file_info *fi)
 	file_info->buflen = 0;
 
 	fi->fh = (unsigned long)file_info;
-	return 0;
+	ret = 0;
+
+out:
+	free(cgpath);
+	free_key(k);
+	return ret;
 }
 
 static int cg_release(const char *path, struct fuse_file_info *fi)
@@ -967,13 +1063,14 @@ again:
 static bool do_read_pids(pid_t tpid, const char *contrl, const char *cg, const char *file, char **d)
 {
 	int sock[2] = {-1, -1};
-	nih_local char *tmpdata = NULL;
+	char *tmpdata = NULL;
 	int ret;
 	pid_t qpid, cpid = -1;
 	bool answer = false;
 	char v = '0';
 	struct ucred cred;
 	struct timeval tv;
+	size_t sz = 0, asz = 0;
 	fd_set s;
 
 	if (!cgm_get_value(contrl, cg, file, &tmpdata))
@@ -987,7 +1084,8 @@ static bool do_read_pids(pid_t tpid, const char *contrl, const char *cg, const c
 
 	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sock) < 0) {
 		perror("socketpair");
-		exit(1);
+		free(tmpdata);
+		return false;
 	}
 
 	cpid = fork();
@@ -1025,7 +1123,7 @@ static bool do_read_pids(pid_t tpid, const char *contrl, const char *cg, const c
 				__func__, strerror(errno));
 			goto out;
 		}
-		NIH_MUST( nih_strcat_sprintf(d, NULL, "%d\n", qpid) );
+		must_strcat_pid(d, &sz, &asz, qpid);
 next:
 		ptr = strchr(ptr, '\n');
 		if (!ptr)
@@ -1045,6 +1143,7 @@ next:
 	answer = true;
 
 out:
+	free(tmpdata);
 	if (cpid != -1)
 		wait_for_pid(cpid);
 	if (sock[0] != -1) {
@@ -1059,7 +1158,10 @@ static int cg_read(const char *path, char *buf, size_t size, off_t offset,
 {
 	struct fuse_context *fc = fuse_get_context();
 	struct file_info *f = (struct file_info *)fi->fh;
-	nih_local struct cgm_keys *k = NULL;
+	struct cgm_keys *k = NULL;
+	char *data = NULL;
+	int s;
+	bool r;
 
 	if (f->type != LXC_TYPE_CGFILE) {
 		fprintf(stderr, "Internal error: directory cache info used in cg_read\n");
@@ -1075,40 +1177,46 @@ static int cg_read(const char *path, char *buf, size_t size, off_t offset,
 	if (!f->controller)
 		return -EINVAL;
 
-	if ((k = get_cgroup_key(f->controller, f->cgroup, f->file)) != NULL) {
-		nih_local char *data = NULL;
-		int s;
-		bool r;
+	if ((k = get_cgroup_key(f->controller, f->cgroup, f->file)) == NULL)
+		return -EINVAL;
 
-		if (!fc_may_access(fc, f->controller, f->cgroup, f->file, O_RDONLY))
-			// should never get here
-			return -EACCES;
 
-		if (strcmp(f->file, "tasks") == 0 ||
-				strcmp(f->file, "/tasks") == 0 ||
-				strcmp(f->file, "/cgroup.procs") == 0 ||
-				strcmp(f->file, "cgroup.procs") == 0)
-			// special case - we have to translate the pids
-			r = do_read_pids(fc->pid, f->controller, f->cgroup, f->file, &data);
-		else
-			r = cgm_get_value(f->controller, f->cgroup, f->file, &data);
-
-		if (!r)
-			return -EINVAL;
-
-		if (!data)
-			return 0;
-		s = strlen(data);
-		if (s > size)
-			s = size;
-		memcpy(buf, data, s);
-		if (s > 0 && s < size && data[s-1] != '\n')
-			buf[s++] = '\n';
-
-		return s;
+	if (!fc_may_access(fc, f->controller, f->cgroup, f->file, O_RDONLY)) { // should never get here
+		ret = -EACCES;
+		goto out;
 	}
 
-	return -EINVAL;
+	if (strcmp(f->file, "tasks") == 0 ||
+			strcmp(f->file, "/tasks") == 0 ||
+			strcmp(f->file, "/cgroup.procs") == 0 ||
+			strcmp(f->file, "cgroup.procs") == 0)
+		// special case - we have to translate the pids
+		r = do_read_pids(fc->pid, f->controller, f->cgroup, f->file, &data);
+	else
+		r = cgm_get_value(f->controller, f->cgroup, f->file, &data);
+
+	if (!r) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (!data) {
+		ret = 0;
+		goto out;
+	}
+	s = strlen(data);
+	if (s > size)
+		s = size;
+	memcpy(buf, data, s);
+	if (s > 0 && s < size && data[s-1] != '\n')
+		buf[s++] = '\n';
+
+	ret = s;
+
+out:
+	free(data);
+	free_key(k);
+	return ret;
 }
 
 static void pid_from_ns(int sock, pid_t tpid)
@@ -1283,9 +1391,10 @@ int cg_write(const char *path, const char *buf, size_t size, off_t offset,
 	     struct fuse_file_info *fi)
 {
 	struct fuse_context *fc = fuse_get_context();
-	nih_local char *localbuf = NULL;
-	nih_local struct cgm_keys *k = NULL;
+	char *localbuf = NULL;
+	struct cgm_keys *k = NULL;
 	struct file_info *f = (struct file_info *)fi->fh;
+	bool r;
 
 	if (f->type != LXC_TYPE_CGFILE) {
 		fprintf(stderr, "Internal error: directory cache info used in cg_write\n");
@@ -1298,42 +1407,41 @@ int cg_write(const char *path, const char *buf, size_t size, off_t offset,
 	if (!fc)
 		return -EIO;
 
-	localbuf = NIH_MUST( nih_alloc(NULL, size+1) );
+	localbuf = alloca(size+1);
 	localbuf[size] = '\0';
 	memcpy(localbuf, buf, size);
 
-	if ((k = get_cgroup_key(f->controller, f->cgroup, f->file)) != NULL) {
-		bool r;
+	if ((k = get_cgroup_key(f->controller, f->cgroup, f->file)) == NULL)
+		return -EINVAL;
 
-		if (!fc_may_access(fc, f->controller, f->cgroup, f->file, O_WRONLY))
-			return -EACCES;
-
-		if (strcmp(f->file, "tasks") == 0 ||
-				strcmp(f->file, "/tasks") == 0 ||
-				strcmp(f->file, "/cgroup.procs") == 0 ||
-				strcmp(f->file, "cgroup.procs") == 0)
-			// special case - we have to translate the pids
-			r = do_write_pids(fc->pid, f->controller, f->cgroup, f->file, localbuf);
-		else
-			r = cgm_set_value(f->controller, f->cgroup, f->file, localbuf);
-
-		if (!r)
-			return -EINVAL;
-
-		return size;
+	if (!fc_may_access(fc, f->controller, f->cgroup, f->file, O_WRONLY)) {
+		free_key(k);
+		return -EACCES;
 	}
 
-	return -EINVAL;
+	if (strcmp(f->file, "tasks") == 0 ||
+			strcmp(f->file, "/tasks") == 0 ||
+			strcmp(f->file, "/cgroup.procs") == 0 ||
+			strcmp(f->file, "cgroup.procs") == 0)
+		// special case - we have to translate the pids
+		r = do_write_pids(fc->pid, f->controller, f->cgroup, f->file, localbuf);
+	else
+		r = cgm_set_value(f->controller, f->cgroup, f->file, localbuf);
+
+	free_key(k);
+
+	if (!r)
+		return -EINVAL;
+
+	return size;
 }
 
 int cg_chown(const char *path, uid_t uid, gid_t gid)
 {
 	struct fuse_context *fc = fuse_get_context();
-	nih_local char * cgdir = NULL;
-	char *fpath = NULL, *path1, *path2;
-	nih_local struct cgm_keys *k = NULL;
+	char *cgdir = NULL, *fpath = NULL, *path1, *path2, char *controller;
+	struct cgm_keys *k = NULL;
 	const char *cgroup;
-	nih_local char *controller = NULL;
 
 
 	if (!fc)
@@ -1368,8 +1476,10 @@ int cg_chown(const char *path, uid_t uid, gid_t gid)
 	} else
 		k = get_cgroup_key(controller, path1, path2);
 
-	if (!k)
+	if (!k) {
+		free(cgdir);
 		return -EINVAL;
+	}
 
 	/*
 	 * This being a fuse request, the uid and gid must be valid
@@ -1377,22 +1487,28 @@ int cg_chown(const char *path, uid_t uid, gid_t gid)
 	 * sure that the caller is root in his uid, and privileged
 	 * over the file's current owner.
 	 */
-	if (!is_privileged_over(fc->pid, fc->uid, k->uid, NS_ROOT_REQD))
-		return -EACCES;
+	if (!is_privileged_over(fc->pid, fc->uid, k->uid, NS_ROOT_REQD)) {
+		ret = -EACCES;
+		goto out;
+	}
 
 	if (!cgm_chown_file(controller, cgroup, uid, gid))
-		return -EINVAL;
+		ret = -EINVAL;
+
+out:
+	free_key(k);
+	free(cgdir);
+
 	return 0;
 }
 
 int cg_chmod(const char *path, mode_t mode)
 {
 	struct fuse_context *fc = fuse_get_context();
-	nih_local char * cgdir = NULL;
-	char *fpath = NULL, *path1, *path2;
-	nih_local struct cgm_keys *k = NULL;
+	char * cgdir = NULL, *fpath = NULL, *path1, *path2, controller;
+	struct cgm_keys *k = NULL;
 	const char *cgroup;
-	nih_local char *controller = NULL;
+	int ret;
 
 	if (!fc)
 		return -EIO;
@@ -1426,6 +1542,7 @@ int cg_chmod(const char *path, mode_t mode)
 	} else
 		k = get_cgroup_key(controller, path1, path2);
 
+	free(cgdir);
 	if (!k)
 		return -EINVAL;
 
@@ -1435,22 +1552,28 @@ int cg_chmod(const char *path, mode_t mode)
 	 * sure that the caller is root in his uid, and privileged
 	 * over the file's current owner.
 	 */
-	if (!is_privileged_over(fc->pid, fc->uid, k->uid, NS_ROOT_OPT))
-		return -EPERM;
+	if (!is_privileged_over(fc->pid, fc->uid, k->uid, NS_ROOT_OPT)) {
+		ret = -EPERM;
+		goto out;
+	}
 
-	if (!cgm_chmod_file(controller, cgroup, mode))
-		return -EINVAL;
-	return 0;
+	if (!cgm_chmod_file(controller, cgroup, mode)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	ret = 0;
+out:
+	free_key(k);
+	return ret;
 }
 
 int cg_mkdir(const char *path, mode_t mode)
 {
 	struct fuse_context *fc = fuse_get_context();
-	nih_local struct cgm_keys **list = NULL;
-	char *fpath = NULL, *path1;
-	nih_local char * cgdir = NULL;
+	char *fpath = NULL, *path1, *cgdir = NULL, *controller;
 	const char *cgroup;
-	nih_local char *controller = NULL;
+	int ret;
 
 	if (!fc)
 		return -EIO;
@@ -1470,28 +1593,31 @@ int cg_mkdir(const char *path, mode_t mode)
 	else
 		path1 = cgdir;
 
-	if (!fc_may_access(fc, controller, path1, NULL, O_RDWR))
-		return -EACCES;
+	if (!fc_may_access(fc, controller, path1, NULL, O_RDWR)) {
+		ret = -EACCES;
+		goto out;
+	}
+	if (!cgm_create(controller, cgroup, fc->uid, fc->gid)) {
+		ret = -EINVAL;
+		goto out;
+	}
 
+	ret = 0;
 
-	if (!cgm_create(controller, cgroup, fc->uid, fc->gid))
-		return -EINVAL;
-
-	return 0;
+out:
+	free(cgdir);
+	return ret;
 }
 
 static int cg_rmdir(const char *path)
 {
 	struct fuse_context *fc = fuse_get_context();
-	nih_local struct cgm_keys **list = NULL;
-	char *fpath = NULL;
-	nih_local char * cgdir = NULL;
+	char *fpath = NULL, *cgdir = NULL, *controller;
 	const char *cgroup;
-	nih_local char *controller = NULL;
+	int ret;
 
 	if (!fc)
 		return -EIO;
-
 
 	controller = pick_controller_from_path(fc, path);
 	if (!controller)
@@ -1502,16 +1628,26 @@ static int cg_rmdir(const char *path)
 		return -EINVAL;
 
 	get_cgdir_and_path(cgroup, &cgdir, &fpath);
-	if (!fpath)
-		return -EINVAL;
+	if (!fpath) {
+		ret = -EINVAL;
+		goto out;
+	}
 
-	if (!fc_may_access(fc, controller, cgdir, NULL, O_WRONLY))
-		return -EACCES;
+	if (!fc_may_access(fc, controller, cgdir, NULL, O_WRONLY)) {
+		ret = -EACCES;
+		goto out;
+	}
 
-	if (!cgm_remove(controller, cgroup))
-		return -EINVAL;
+	if (!cgm_remove(controller, cgroup)) {
+		ret = -EINVAL;
+		goto out;
+	}
 
-	return 0;
+	ret = 0;
+
+out:
+	free(cgdir);
+	return ret;
 }
 
 static bool startswith(const char *line, const char *pref)
@@ -1564,15 +1700,18 @@ static void get_blkio_io_value(char *str, unsigned major, unsigned minor, char *
 
 static char *get_pid_cgroup(pid_t pid, const char *contrl)
 {
-	nih_local char *fnam = NULL;
+	char *fnam[PROCLEN];
 	FILE *f;
 	char *answer = NULL;
 	char *line = NULL;
 	size_t len = 0;
+	int ret;
 
-	fnam = NIH_MUST( nih_sprintf(NULL, "/proc/%d/cgroup", pid) );
+	ret = snprintf(fnam, "/proc/%d/cgroup", pid);
+	if (ret < 0 || ret >= PROCLEN)
+		return NULL;
 	if (!(f = fopen(fnam, "r")))
-		return false;
+		return NULL;
 
 	while (getline(&line, &len, f) != -1) {
 		char *c1, *c2;
@@ -1590,8 +1729,9 @@ static char *get_pid_cgroup(pid_t pid, const char *contrl)
 			continue;
 		c2++;
 		stripnewline(c2);
-		answer = NIH_MUST( nih_strdup(NULL, c2) );
-		goto out;
+		do {
+			answer = strdup(c2);
+		} while (!answer);
 	}
 
 out:
@@ -1656,14 +1796,15 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 {
 	struct fuse_context *fc = fuse_get_context();
 	struct file_info *d = (struct file_info *)fi->fh;
-	nih_local char *cg = get_pid_cgroup(fc->pid, "memory");
-	nih_local char *memlimit_str = NULL, *memusage_str = NULL, *memstat_str = NULL;
+	char *cg;
+	char *memlimit_str = NULL, *memusage_str = NULL, *memstat_str = NULL;
 	unsigned long memlimit = 0, memusage = 0, cached = 0, hosttotal = 0;
 	char *line = NULL;
 	size_t linelen = 0, total_len = 0, rv = 0;
 	char *cache = d->buf;
 	size_t cache_size = d->buflen;
-	FILE *f;
+	int ret;
+	FILE *f = NULL;
 
 	if (offset){
 		if (offset > d->size)
@@ -1674,15 +1815,16 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 		return total_len;
 	}
 
+	cg = get_pid_cgroup(fc->pid, "memory");
 	if (!cg)
 		return read_file("/proc/meminfo", buf, size, d);
 
 	if (!cgm_get_value("memory", cg, "memory.limit_in_bytes", &memlimit_str))
-		return 0;
+		goto err;
 	if (!cgm_get_value("memory", cg, "memory.usage_in_bytes", &memusage_str))
-		return 0;
+		goto err;
 	if (!cgm_get_value("memory", cg, "memory.stat", &memstat_str))
-		return 0;
+		goto err;
 	memlimit = strtoul(memlimit_str, NULL, 10);
 	memusage = strtoul(memusage_str, NULL, 10);
 	memlimit /= 1024;
@@ -1691,7 +1833,7 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 
 	f = fopen("/proc/meminfo", "r");
 	if (!f)
-		return 0;
+		goto err;
 
 	while (getline(&line, &linelen, f) != -1) {
 		size_t l;
@@ -1746,14 +1888,19 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 
 	rv = total_len;
   err:
-	fclose(f);
+	if (f)
+		fclose(f);
 	free(line);
+	free(cg);
+	free(memlimit_str);
+	free(memusage_str);
+	free(memstat_str);
 	return rv;
 }
 
 /*
  * Read the cpuset.cpus for cg
- * Return the answer in a nih_alloced string
+ * Return the answer in a newly allocated string which must be freed
  */
 static char *get_cpuset(const char *cg)
 {
@@ -1792,15 +1939,15 @@ static int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 {
 	struct fuse_context *fc = fuse_get_context();
 	struct file_info *d = (struct file_info *)fi->fh;
-	nih_local char *cg = get_pid_cgroup(fc->pid, "cpuset");
-	nih_local char *cpuset = NULL;
+	char *cg;
+	char *cpuset = NULL;
 	char *line = NULL;
 	size_t linelen = 0, total_len = 0, rv = 0;
 	bool am_printing = false;
 	int curcpu = -1;
 	char *cache = d->buf;
 	size_t cache_size = d->buflen;
-	FILE *f;
+	FILE *f = NULL;
 
 	if (offset){
 		if (offset > d->size)
@@ -1811,16 +1958,17 @@ static int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 		return total_len;
 	}
 
+	cg = get_pid_cgroup(fc->pid, "cpuset");
 	if (!cg)
 		return read_file("proc/cpuinfo", buf, size, d);
 
 	cpuset = get_cpuset(cg);
 	if (!cpuset)
-		return 0;
+		goto err;
 
 	f = fopen("/proc/cpuinfo", "r");
 	if (!f)
-		return 0;
+		goto err;
 
 	while (getline(&line, &linelen, f) != -1) {
 		size_t l;
@@ -1884,8 +2032,11 @@ static int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 	memcpy(buf, d->buf, total_len);
 	rv = total_len;
   err:
-	fclose(f);
+	if (f)
+		fclose(f);
 	free(line);
+	free(cpuset);
+	free(cg);
 	return rv;
 }
 
@@ -1894,8 +2045,8 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 {
 	struct fuse_context *fc = fuse_get_context();
 	struct file_info *d = (struct file_info *)fi->fh;
-	nih_local char *cg = get_pid_cgroup(fc->pid, "cpuset");
-	nih_local char *cpuset = NULL;
+	char *cg;
+	char *cpuset = NULL;
 	char *line = NULL;
 	size_t linelen = 0, total_len = 0, rv = 0;
 	int curcpu = -1; /* cpu numbering starts at 0 */
@@ -1907,7 +2058,7 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 	/* reserve for cpu all */
 	char *cache = d->buf + CPUALL_MAX_SIZE;
 	size_t cache_size = d->buflen - CPUALL_MAX_SIZE;
-	FILE *f;
+	FILE *f = NULL;
 
 	if (offset){
 		if (offset > d->size)
@@ -1918,21 +2069,22 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 		return total_len;
 	}
 
+	cg = get_pid_cgroup(fc->pid, "cpuset");
 	if (!cg)
 		return read_file("/proc/stat", buf, size, d);
 
 	cpuset = get_cpuset(cg);
 	if (!cpuset)
-		return 0;
+		goto err;
 
 	f = fopen("/proc/stat", "r");
 	if (!f)
-		return 0;
+		goto err;
 
 	//skip first line
 	if (getline(&line, &linelen, f) < 0) {
 		fprintf(stderr, "proc_stat_read read first line failed\n");
-		goto out;
+		goto err;
 	}
 
 	while (getline(&line, &linelen, f) != -1) {
@@ -2015,7 +2167,7 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 	if (cpuall_len > 0 && cpuall_len < CPUALL_MAX_SIZE){
 		memcpy(cache, cpuall, cpuall_len);
 		cache += cpuall_len;
-	}else{
+	} else{
 		/* shouldn't happen */
 		fprintf(stderr, "proc_stat_read copy cpuall failed, cpuall_len=%d\n", cpuall_len);
 		cpuall_len = 0;
@@ -2027,11 +2179,14 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 	if (total_len > size ) total_len = size;
 
 	memcpy(buf, d->buf, total_len);
-  out:
 	rv = total_len;
-  err:
-	fclose(f);
+
+err:
+	if (f)
+		fclose(f);
 	free(line);
+	free(cpuset);
+	free(cg);
 	return rv;
 }
 
@@ -2239,8 +2394,8 @@ static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 	char dev_name[72];
 	struct fuse_context *fc = fuse_get_context();
 	struct file_info *d = (struct file_info *)fi->fh;
-	nih_local char *cg = get_pid_cgroup(fc->pid, "blkio");
-	nih_local char *io_serviced_str = NULL, *io_merged_str = NULL, *io_service_bytes_str = NULL,
+	char *cg;
+	char *io_serviced_str = NULL, *io_merged_str = NULL, *io_service_bytes_str = NULL,
 			*io_wait_time_str = NULL, *io_service_time_str = NULL;
 	unsigned long read = 0, write = 0;
 	unsigned long read_merged = 0, write_merged = 0;
@@ -2252,7 +2407,7 @@ static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 	size_t linelen = 0, total_len = 0, rv = 0;
 	unsigned int major = 0, minor = 0;
 	int i = 0;
-	FILE *f;
+	FILE *f = NULL;
 
 	if (offset){
 		if (offset > d->size)
@@ -2260,24 +2415,25 @@ static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 		return 0;
 	}
 
+	cg = get_pid_cgroup(fc->pid, "blkio");
 	if (!cg)
 		return read_file("/proc/diskstats", buf, size, d);
 
 	if (!cgm_get_value("blkio", cg, "blkio.io_serviced", &io_serviced_str))
-		return 0;
+		goto out;
 	if (!cgm_get_value("blkio", cg, "blkio.io_merged", &io_merged_str))
-		return 0;
+		goto out;
 	if (!cgm_get_value("blkio", cg, "blkio.io_service_bytes", &io_service_bytes_str))
-		return 0;
+		goto out;
 	if (!cgm_get_value("blkio", cg, "blkio.io_wait_time", &io_wait_time_str))
-		return 0;
+		goto out;
 	if (!cgm_get_value("blkio", cg, "blkio.io_service_time", &io_service_time_str))
-		return 0;
+		goto out;
 
 
 	f = fopen("/proc/diskstats", "r");
 	if (!f)
-		return 0;
+		goto out;
 
 	while (getline(&line, &linelen, f) != -1) {
 		size_t l;
@@ -2339,9 +2495,16 @@ static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 
 	d->size = total_len;
 	rv = total_len;
-  err:
-	fclose(f);
+err:
+	free(cg);
+	if (f)
+		fclose(f);
 	free(line);
+	free(io_serviced_str);
+	free(io_merged_str);
+	free(io_service_bytes_str);
+	free(io_wait_time_str);
+	free(io_service_time_str);
 	return rv;
 }
 
@@ -2406,6 +2569,7 @@ static int proc_open(const char *path, struct fuse_file_info *fi)
 {
 	int type = -1;
 	struct file_info *info;
+	int ret;
 
 	if (strcmp(path, "/proc/meminfo") == 0)
 		type = LXC_TYPE_PROC_MEMINFO;
@@ -2420,12 +2584,17 @@ static int proc_open(const char *path, struct fuse_file_info *fi)
 	if (type == -1)
 		return -ENOENT;
 
-	info = NIH_MUST( nih_alloc(NULL, sizeof(*info)) );
+	info = malloc(sizeof(*info));
+	if (!info)
+		return -ENOMEM;
+
 	memset(info, 0, sizeof(*info));
 	info->type = type;
 
 	info->buflen = get_procfile_size(path) + BUF_RESERVE_SIZE;
-	info->buf = NIH_MUST( nih_alloc(info, info->buflen) );
+	do {
+		info->buf = malloc(info->buflen);
+	} while (!info->buf);
 	memset(info->buf, 0, info->buflen);
 	/* set actual size to buffer size */
 	info->size = info->buflen;
@@ -2717,15 +2886,6 @@ void swallow_option(int *argcp, char *argv[], char *opt, char *v)
 	}
 }
 
-bool detect_libnih_threadsafe(void)
-{
-#ifdef HAVE_NIH_THREADSAFE
-	if (nih_threadsafe())
-		return true;
-#endif
-	return false;
-}
-
 int main(int argc, char *argv[])
 {
 	int ret = -1;
@@ -2734,16 +2894,8 @@ int main(int argc, char *argv[])
 	 * what we pass to fuse_main is:
 	 * argv[0] -s -f -o allow_other,directio argv[1] NULL
 	 */
-	int nargs = 6;
-	bool threadsafe = detect_libnih_threadsafe();
-	char *newargv[7]; // one more than if needed if threadsafe
-
-	threadsafe = false; // still not safe with libnih+libdbus
-
-	dbus_threads_init_default();
-
-	if (threadsafe)
-		nargs = 5;
+	int nargs = 5, cnt = 0;
+	char *newargv[6];
 
 	/* accomodate older init scripts */
 	swallow_arg(&argc, argv, "-s");
@@ -2757,12 +2909,11 @@ int main(int argc, char *argv[])
 	if (argc != 2 || is_help(argv[1]))
 		usage(argv[0]);
 
-	d = NIH_MUST( malloc(sizeof(*d)) );
+	do {
+		d = malloc(sizeof(*d));
+	} while (!d);
 
-	int cnt = 0;
 	newargv[cnt++] = argv[0];
-	if (!threadsafe)
-		newargv[cnt++] = "-s";
 	newargv[cnt++] = "-f";
 	newargv[cnt++] = "-o";
 	newargv[cnt++] = "allow_other,direct_io";
