@@ -54,18 +54,20 @@ void cgm_dbus_disconnect(void)
 {
 	GError *error = NULL;
 
-	if (cgroup_manager) {
-		if (!g_dbus_connection_flush_sync(cgroup_manager, NULL, &error)) {
-			g_warning("failed to flush connection: %s."
-					"Use G_DBUS_DEBUG=message for more info.", error->message);
-			g_error_free(error);
-		}
-		if (!g_dbus_connection_close_sync(cgroup_manager, NULL, &error)) {
-			g_warning("failed to close connection: %s."
-					"Use G_DBUS_DEBUG=message for more info.", error->message);
-			g_error_free(error);
-		}
+	if (!cgroup_manager)
+		return;
+
+	if (!g_dbus_connection_flush_sync(cgroup_manager, NULL, &error)) {
+		g_warning("failed to flush connection: %s."
+				"Use G_DBUS_DEBUG=message for more info.", error->message);
+		g_error_free(error);
 	}
+	if (!g_dbus_connection_close_sync(cgroup_manager, NULL, &error)) {
+		g_warning("failed to close connection: %s."
+				"Use G_DBUS_DEBUG=message for more info.", error->message);
+		g_error_free(error);
+	}
+	g_object_unref(cgroup_manager);
 	cgroup_manager = NULL;
 }
 
@@ -122,8 +124,11 @@ static bool cgcall(const gchar *method_name, GVariant *parameters,
 	GVariant *my_reply = NULL;
 	GError *error = NULL;
 
-	if (!cgm_dbus_connect())
+	if (!cgm_dbus_connect()) {
+		g_warning("Error: unable to connect to cgmanager");
 		return false;
+	}
+
 	if (!reply)
 		reply = &my_reply;
 	/* We do this sync because we need to ensure that the calls finish
@@ -238,6 +243,7 @@ bool cgm_list_keys(const char *controller, const char *cgroup, struct cgm_keys *
 	gchar *name;
 	guint32 uid, gid, mode;
 
+	fprintf(stderr, "listkeys: pid %d\n", getpid());
 	if (!cgcall("ListKeys", g_variant_new("(ss)", controller, cgroup),
 			G_VARIANT_TYPE("(a(suuu))"), &reply))
 		return false;

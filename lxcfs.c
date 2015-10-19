@@ -627,6 +627,7 @@ static int cg_getattr(const char *path, struct stat *sb)
 	}
 
 out:
+	cgm_dbus_disconnect();
 	free(cgdir);
 	return ret;
 }
@@ -661,8 +662,11 @@ static int cg_opendir(const char *path, struct fuse_file_info *fi)
 		}
 	}
 
-	if (cgroup && !fc_may_access(fc, controller, cgroup, NULL, O_RDONLY))
+	if (cgroup && !fc_may_access(fc, controller, cgroup, NULL, O_RDONLY)) {
+		cgm_dbus_disconnect();
 		return -EACCES;
+	}
+	cgm_dbus_disconnect();
 
 	/* we'll free this at cg_releasedir */
 	dir_info = malloc(sizeof(*dir_info));
@@ -709,9 +713,11 @@ static int cg_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 		return 0;
 	}
 
-	if (!cgm_list_keys(d->controller, d->cgroup, &list))
+	if (!cgm_list_keys(d->controller, d->cgroup, &list)) {
 		// not a valid cgroup
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
+	}
 
 	if (!caller_is_in_ancestor(fc->pid, d->controller, d->cgroup, &nextcg)) {
 		if (nextcg) {
@@ -749,6 +755,7 @@ static int cg_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 	ret = 0;
 
 out:
+	cgm_dbus_disconnect();
 	free_keys(list);
 	if (clist) {
 		for (i = 0; clist[i]; i++)
@@ -832,6 +839,7 @@ static int cg_open(const char *path, struct fuse_file_info *fi)
 	ret = 0;
 
 out:
+	cgm_dbus_disconnect();
 	free(cgdir);
 	return ret;
 }
@@ -1183,8 +1191,10 @@ static int cg_read(const char *path, char *buf, size_t size, off_t offset,
 	if (!f->controller)
 		return -EINVAL;
 
-	if ((k = get_cgroup_key(f->controller, f->cgroup, f->file)) == NULL)
+	if ((k = get_cgroup_key(f->controller, f->cgroup, f->file)) == NULL) {
+		cgm_dbus_disconnect();
 		return -EINVAL;
+	}
 	free_key(k);
 
 
@@ -1221,6 +1231,7 @@ static int cg_read(const char *path, char *buf, size_t size, off_t offset,
 	ret = s;
 
 out:
+	cgm_dbus_disconnect();
 	free(data);
 	return ret;
 }
@@ -1384,6 +1395,7 @@ static bool do_write_pids(pid_t tpid, const char *contrl, const char *cg, const 
 		answer = true;
 
 out:
+	cgm_dbus_disconnect();
 	if (cpid != -1)
 		wait_for_pid(cpid);
 	if (sock[0] != -1) {
@@ -1417,12 +1429,14 @@ int cg_write(const char *path, const char *buf, size_t size, off_t offset,
 	localbuf[size] = '\0';
 	memcpy(localbuf, buf, size);
 
-	if ((k = get_cgroup_key(f->controller, f->cgroup, f->file)) == NULL)
-		return -EINVAL;
+	if ((k = get_cgroup_key(f->controller, f->cgroup, f->file)) == NULL) {
+		size = -EINVAL;
+		goto out;
+	}
 
 	if (!fc_may_access(fc, f->controller, f->cgroup, f->file, O_WRONLY)) {
-		free_key(k);
-		return -EACCES;
+		size = -EACCES;
+		goto out;
 	}
 
 	if (strcmp(f->file, "tasks") == 0 ||
@@ -1434,11 +1448,12 @@ int cg_write(const char *path, const char *buf, size_t size, off_t offset,
 	else
 		r = cgm_set_value(f->controller, f->cgroup, f->file, localbuf);
 
-	free_key(k);
-
 	if (!r)
-		return -EINVAL;
+		size = -EINVAL;
 
+out:
+	free_key(k);
+	cgm_dbus_disconnect();
 	return size;
 }
 
@@ -1483,8 +1498,8 @@ int cg_chown(const char *path, uid_t uid, gid_t gid)
 		k = get_cgroup_key(controller, path1, path2);
 
 	if (!k) {
-		free(cgdir);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	/*
@@ -1498,12 +1513,15 @@ int cg_chown(const char *path, uid_t uid, gid_t gid)
 		goto out;
 	}
 
-	if (!cgm_chown_file(controller, cgroup, uid, gid))
+	if (!cgm_chown_file(controller, cgroup, uid, gid)) {
 		ret = -EINVAL;
+		goto out;
+	}
 
 	ret = 0;
 
 out:
+	cgm_dbus_disconnect();
 	free_key(k);
 	free(cgdir);
 
@@ -1550,9 +1568,10 @@ int cg_chmod(const char *path, mode_t mode)
 	} else
 		k = get_cgroup_key(controller, path1, path2);
 
-	free(cgdir);
-	if (!k)
-		return -EINVAL;
+	if (!k) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	/*
 	 * This being a fuse request, the uid and gid must be valid
@@ -1572,7 +1591,9 @@ int cg_chmod(const char *path, mode_t mode)
 
 	ret = 0;
 out:
+	cgm_dbus_disconnect();
 	free_key(k);
+	free(cgdir);
 	return ret;
 }
 
@@ -1613,6 +1634,7 @@ int cg_mkdir(const char *path, mode_t mode)
 	ret = 0;
 
 out:
+	cgm_dbus_disconnect();
 	free(cgdir);
 	return ret;
 }
@@ -1654,6 +1676,7 @@ static int cg_rmdir(const char *path)
 	ret = 0;
 
 out:
+	cgm_dbus_disconnect();
 	free(cgdir);
 	return ret;
 }
@@ -1894,7 +1917,8 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 	memcpy(buf, d->buf, total_len);
 
 	rv = total_len;
-  err:
+err:
+	cgm_dbus_disconnect();
 	if (f)
 		fclose(f);
 	free(line);
@@ -2038,7 +2062,8 @@ static int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 	/* read from off 0 */
 	memcpy(buf, d->buf, total_len);
 	rv = total_len;
-  err:
+err:
+	cgm_dbus_disconnect();
 	if (f)
 		fclose(f);
 	free(line);
@@ -2189,6 +2214,7 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 	rv = total_len;
 
 err:
+	cgm_dbus_disconnect();
 	if (f)
 		fclose(f);
 	free(line);
@@ -2503,6 +2529,7 @@ static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 	d->size = total_len;
 	rv = total_len;
 err:
+	cgm_dbus_disconnect();
 	free(cg);
 	if (f)
 		fclose(f);
@@ -2931,6 +2958,7 @@ int main(int argc, char *argv[])
 
 	if (!cgm_get_controllers(&d->subsystems))
 		goto out;
+	cgm_dbus_disconnect();
 
 	ret = fuse_main(nargs, newargv, &lxcfs_ops, d);
 
