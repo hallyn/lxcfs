@@ -100,6 +100,8 @@ static char *must_copy_string(void *parent, const char *str)
 	do {
 		dup = strdup(str);
 	} while (!dup);
+
+	return dup;
 }
 
 /*
@@ -305,7 +307,8 @@ static bool fc_may_access(struct fuse_context *fc, const char *contrl, const cha
 					goto out;
 				}
 			}
-			return perms_include(k->mode, mode);
+			ret = perms_include(k->mode, mode);
+			goto out;
 		}
 	}
 
@@ -486,6 +489,7 @@ static struct cgm_keys *get_cgroup_key(const char *contr, const char *dir, const
 	for (i = 0; list[i]; i++) {
 		if (strcmp(list[i]->name, f) == 0) {
 			int j;
+			// free all the keys we are not returning
 			k = list[i];
 			for (j = 0; list[j]; j++) {
 				if (i != j)
@@ -531,7 +535,7 @@ static int cg_getattr(const char *path, struct stat *sb)
 	char *fpath = NULL, *path1, *path2;
 	struct cgm_keys *k = NULL;
 	const char *cgroup;
-	char *controller = NULL;
+	const char *controller = NULL;
 	int ret = -ENOENT;
 
 
@@ -589,6 +593,7 @@ static int cg_getattr(const char *path, struct stat *sb)
 		if (!fc_may_access(fc, controller, cgroup, NULL, O_RDONLY)) {
 			ret = -EACCES;
 			goto out;
+		}
 
 		// get uid, gid, from '/tasks' file and make up a mode
 		// That is a hack, until cgmanager gains a GetCgroupPerms fn.
@@ -600,27 +605,28 @@ static int cg_getattr(const char *path, struct stat *sb)
 			sb->st_uid = k->uid;
 			sb->st_gid = k->gid;
 		}
+		free_key(k);
 		sb->st_nlink = 2;
 		ret = 0;
 		goto out;
 	}
 
 	if ((k = get_cgroup_key(controller, path1, path2)) != NULL) {
-		if (!caller_is_in_ancestor(fc->pid, controller, path1, NULL))
-			return -ENOENT;
-		if (!fc_may_access(fc, controller, path1, path2, O_RDONLY))
-			return -EACCES;
-
 		sb->st_mode = S_IFREG | k->mode;
 		sb->st_nlink = 1;
 		sb->st_uid = k->uid;
 		sb->st_gid = k->gid;
 		sb->st_size = 0;
+		free_key(k);
+		if (!caller_is_in_ancestor(fc->pid, controller, path1, NULL))
+			return -ENOENT;
+		if (!fc_may_access(fc, controller, path1, path2, O_RDONLY))
+			return -EACCES;
+
 		ret = 0;
 	}
 
 out:
-	free_key(k);
 	free(cgdir);
 	return ret;
 }
@@ -678,7 +684,7 @@ static int cg_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 {
 	struct file_info *d = (struct file_info *)fi->fh;
 	struct cgm_keys **list = NULL;
-	int i;
+	int i, ret;
 	char *nextcg = NULL;
 	struct fuse_context *fc = fuse_get_context();
 	char **clist = NULL;
@@ -801,6 +807,7 @@ static int cg_open(const char *path, struct fuse_file_info *fi)
 		ret = -EINVAL;
 		goto out;
 	}
+	free_key(k);
 
 	if (!fc_may_access(fc, controller, path1, path2, fi->flags)) {
 		// should never get here
@@ -825,8 +832,7 @@ static int cg_open(const char *path, struct fuse_file_info *fi)
 	ret = 0;
 
 out:
-	free(cgpath);
-	free_key(k);
+	free(cgdir);
 	return ret;
 }
 
@@ -1160,7 +1166,7 @@ static int cg_read(const char *path, char *buf, size_t size, off_t offset,
 	struct file_info *f = (struct file_info *)fi->fh;
 	struct cgm_keys *k = NULL;
 	char *data = NULL;
-	int s;
+	int ret, s;
 	bool r;
 
 	if (f->type != LXC_TYPE_CGFILE) {
@@ -1179,6 +1185,7 @@ static int cg_read(const char *path, char *buf, size_t size, off_t offset,
 
 	if ((k = get_cgroup_key(f->controller, f->cgroup, f->file)) == NULL)
 		return -EINVAL;
+	free_key(k);
 
 
 	if (!fc_may_access(fc, f->controller, f->cgroup, f->file, O_RDONLY)) { // should never get here
@@ -1215,7 +1222,6 @@ static int cg_read(const char *path, char *buf, size_t size, off_t offset,
 
 out:
 	free(data);
-	free_key(k);
 	return ret;
 }
 
@@ -1439,10 +1445,10 @@ int cg_write(const char *path, const char *buf, size_t size, off_t offset,
 int cg_chown(const char *path, uid_t uid, gid_t gid)
 {
 	struct fuse_context *fc = fuse_get_context();
-	char *cgdir = NULL, *fpath = NULL, *path1, *path2, char *controller;
+	char *cgdir = NULL, *fpath = NULL, *path1, *path2, *controller;
 	struct cgm_keys *k = NULL;
 	const char *cgroup;
-
+	int ret;
 
 	if (!fc)
 		return -EIO;
@@ -1495,17 +1501,19 @@ int cg_chown(const char *path, uid_t uid, gid_t gid)
 	if (!cgm_chown_file(controller, cgroup, uid, gid))
 		ret = -EINVAL;
 
+	ret = 0;
+
 out:
 	free_key(k);
 	free(cgdir);
 
-	return 0;
+	return ret;
 }
 
 int cg_chmod(const char *path, mode_t mode)
 {
 	struct fuse_context *fc = fuse_get_context();
-	char * cgdir = NULL, *fpath = NULL, *path1, *path2, controller;
+	char * cgdir = NULL, *fpath = NULL, *path1, *path2, *controller;
 	struct cgm_keys *k = NULL;
 	const char *cgroup;
 	int ret;
@@ -1707,7 +1715,7 @@ static char *get_pid_cgroup(pid_t pid, const char *contrl)
 	size_t len = 0;
 	int ret;
 
-	ret = snprintf(fnam, "/proc/%d/cgroup", pid);
+	ret = snprintf(fnam, PROCLEN, "/proc/%d/cgroup", pid);
 	if (ret < 0 || ret >= PROCLEN)
 		return NULL;
 	if (!(f = fopen(fnam, "r")))
@@ -1803,7 +1811,6 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 	size_t linelen = 0, total_len = 0, rv = 0;
 	char *cache = d->buf;
 	size_t cache_size = d->buflen;
-	int ret;
 	FILE *f = NULL;
 
 	if (offset){
@@ -2420,20 +2427,20 @@ static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 		return read_file("/proc/diskstats", buf, size, d);
 
 	if (!cgm_get_value("blkio", cg, "blkio.io_serviced", &io_serviced_str))
-		goto out;
+		goto err;
 	if (!cgm_get_value("blkio", cg, "blkio.io_merged", &io_merged_str))
-		goto out;
+		goto err;
 	if (!cgm_get_value("blkio", cg, "blkio.io_service_bytes", &io_service_bytes_str))
-		goto out;
+		goto err;
 	if (!cgm_get_value("blkio", cg, "blkio.io_wait_time", &io_wait_time_str))
-		goto out;
+		goto err;
 	if (!cgm_get_value("blkio", cg, "blkio.io_service_time", &io_service_time_str))
-		goto out;
+		goto err;
 
 
 	f = fopen("/proc/diskstats", "r");
 	if (!f)
-		goto out;
+		goto err;
 
 	while (getline(&line, &linelen, f) != -1) {
 		size_t l;
@@ -2569,7 +2576,6 @@ static int proc_open(const char *path, struct fuse_file_info *fi)
 {
 	int type = -1;
 	struct file_info *info;
-	int ret;
 
 	if (strcmp(path, "/proc/meminfo") == 0)
 		type = LXC_TYPE_PROC_MEMINFO;

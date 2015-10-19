@@ -39,6 +39,8 @@
 #include <netinet/in.h>
 #include <net/if.h>
 #include <stdbool.h>
+#include "cgmanager.h"
+#include <assert.h>
 
 #include <glib.h>
 #include <gio/gio.h>
@@ -48,26 +50,26 @@
 
 static __thread GDBusConnection *cgroup_manager = NULL;
 
-static void cgm_dbus_disconnect(void *)
+void cgm_dbus_disconnect(void)
 {
-       GError *error = NULL;
+	GError *error = NULL;
 
-       if (cgroup_manager) {
-	       if (!g_dbus_connection_flush_sync(cgroup_manager, NULL, &error)) {
-		       g_warning("failed to flush connection: %s."
-		           "Use G_DBUS_DEBUG=message for more info.", error->message);
-		       g_error_free(error);
-	       }
-	       if (!g_dbus_connection_close(cgroup_manager, NULL)) {
-		       g_warning("failed to close connection: %s."
-		           "Use G_DBUS_DEBUG=message for more info.", error->message);
-		       g_error_free(error);
-	       }
-       }
-       cgroup_manager = NULL;
+	if (cgroup_manager) {
+		if (!g_dbus_connection_flush_sync(cgroup_manager, NULL, &error)) {
+			g_warning("failed to flush connection: %s."
+					"Use G_DBUS_DEBUG=message for more info.", error->message);
+			g_error_free(error);
+		}
+		if (!g_dbus_connection_close_sync(cgroup_manager, NULL, &error)) {
+			g_warning("failed to close connection: %s."
+					"Use G_DBUS_DEBUG=message for more info.", error->message);
+			g_error_free(error);
+		}
+	}
+	cgroup_manager = NULL;
 }
 
-static bool cgm_dbus_connect(void)
+bool cgm_dbus_connect(void)
 {
 	GDBusConnection *connection;
 	GVariant *reply;
@@ -85,11 +87,12 @@ static bool cgm_dbus_connect(void)
 			"Use G_DBUS_DEBUG=message for more info.", error->message);
 		g_error_free(error);
 		return false;
+	}
 
 	reply = g_dbus_connection_call_sync (connection, NULL, "/org/linuxcontainers/cgmanager",
 			"org.freedesktop.DBus.Properties", "Get",
 			g_variant_new ("(ss)", "org.linuxcontainers.cgmanager0_0", "api_version"),
-			G_VARIANT_TYPE ("(v)"), G_DBUS_CALL_FLAGS_NONE, -1, NULL, error);
+			G_VARIANT_TYPE ("(v)"), G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
 	if (!reply)
 	{
 		g_warning("Failed to get cgmanager api version: %s\n"
@@ -108,7 +111,7 @@ static bool cgm_dbus_connect(void)
 		return false;
 	}
 	g_variant_unref (version);
-	pthread_cleanup_push(cgm_dbus_disconnect, NULL);
+	cgroup_manager = connection;
 
 	return true;
 }
@@ -117,6 +120,8 @@ static bool cgcall(const gchar *method_name, GVariant *parameters,
 		const GVariantType *reply_type, GVariant **reply)
 {
 	GVariant *my_reply = NULL;
+	GError *error = NULL;
+
 	if (!cgm_dbus_connect())
 		return false;
 	if (!reply)
@@ -124,7 +129,7 @@ static bool cgcall(const gchar *method_name, GVariant *parameters,
 	/* We do this sync because we need to ensure that the calls finish
 	 * before we return to _our_ caller saying that this is done.
 	 */
-	*reply = g_dbus_connection_call_sync (connection, NULL, "/org/linuxcontainers/cgmanager",
+	*reply = g_dbus_connection_call_sync (cgroup_manager, NULL, "/org/linuxcontainers/cgmanager",
 			"org.linuxcontainers.cgmanager0_0", method_name,
 			parameters, reply_type, G_DBUS_CALL_FLAGS_NONE,
 			-1, NULL, &error);
@@ -153,7 +158,7 @@ bool cgm_get_controllers(char ***contrls)
 	gchar *ctrl;
 	int i = 0;
 
-	if (!cgcall("ListControllers", G_VARIANT_TYPE_UNIT, G_VARIANT_TYPE("(as)", &reply)))
+	if (!cgcall("ListControllers", NULL, G_VARIANT_TYPE("(as)"), &reply))
 		return false;
 
 	do {
@@ -194,15 +199,14 @@ void free_keys(struct cgm_keys **keys)
 	if (!keys)
 		return;
 	for (i = 0; keys[i]; i++) {
-		free_key(keys[i];
+		free_key(keys[i]);
 	}
 	free(keys);
 }
 
-#define BATCH_SIZE 10
+#define BATCH_SIZE 50
 void append_key(struct cgm_keys ***keys, struct cgm_keys *newk, size_t *sz, size_t *asz)
 {
-	struct cgm_keys **tmp;
 	assert(keys);
 	if (sz == 0) {
 		*asz = BATCH_SIZE;
@@ -210,15 +214,16 @@ void append_key(struct cgm_keys ***keys, struct cgm_keys *newk, size_t *sz, size
 		do {
 			*keys = malloc(*asz * sizeof(struct cgm_keys *));
 		} while (!*keys);
-		memset(*keys, 0, *asz * sizeof(struct cgm_keys *));
 		(*keys)[0] = newk;
+		(*keys)[1] = NULL;
 		return;
 	}
 	if (*sz + 2 >= *asz) {
+		struct cgm_keys **tmp;
 		*asz += BATCH_SIZE;
 		do {
 			tmp = realloc(*keys, *asz * sizeof(struct cgm_keys *));
-		} while (!*keys);
+		} while (!tmp);
 		*keys = tmp;
 	}
 	(*keys)[(*sz)++] = newk;
@@ -227,21 +232,20 @@ void append_key(struct cgm_keys ***keys, struct cgm_keys *newk, size_t *sz, size
 
 bool cgm_list_keys(const char *controller, const char *cgroup, struct cgm_keys ***keys)
 {
-	size_t used = 0, alloced = 0;
 	GVariantIter *iter = NULL;
 	GVariant *reply = NULL;
 	size_t sz = 0, asz = 0;
+	gchar *name;
+	guint32 uid, gid, mode;
 
 	if (!cgcall("ListKeys", g_variant_new("(ss)", controller, cgroup),
-			G_VARIANT_TYPE("a(suuu)", &reply)))
+			G_VARIANT_TYPE("(a(suuu))"), &reply))
 		return false;
 
-	g_variant_get(reply, "(suuu)", &iter);
-	while (g_variant_iter_next(iter, "suuu", &name, &uid, &gid, &perms)) {
-		/* name, owner, groupid, perms) */
-		gchar *name;
-		GVariant *uid, *gid, *perms;
-		struct cgm_key *k;
+	g_variant_get(reply, "(a(suuu))", &iter);
+	while (g_variant_iter_next(iter, "(suuu)", &name, &uid, &gid, &mode)) {
+		/* name, owner, groupid, mode) */
+		struct cgm_keys *k;
 
 		do {
 			k = malloc(sizeof(*k));
@@ -249,14 +253,11 @@ bool cgm_list_keys(const char *controller, const char *cgroup, struct cgm_keys *
 		do {
 			k->name = strdup(name);
 		} while (!k->name);
-		k->uid = g_variant_get_int32(uid);
-		k->gid = g_variant_get_int32(gid);
-		k->perms = g_variant_get_int32(perms);
-		g_variant_unref(uid);
-		g_variant_unref(gid);
-		g_variant_unref(perms);
+		k->uid = uid;
+		k->gid = gid;
+		k->mode = mode;
 		g_free(name);
-		append_key(keys, k, sz, asz);
+		append_key(keys, k, &sz, &asz);
 	}
 
 	g_variant_iter_free(iter);
@@ -267,18 +268,61 @@ bool cgm_list_keys(const char *controller, const char *cgroup, struct cgm_keys *
 
 bool cgm_list_children(const char *controller, const char *cgroup, char ***list)
 {
+	GVariantIter *iter = NULL;
+	GVariant *reply = NULL;
+	gchar *child;
+	size_t sz = 0, asz = 0;
+
 	if (!cgcall("ListChildren", g_variant_new("(ss)", controller, cgroup),
-			G_VARIANT_TYPE("as"), &reply))
+			G_VARIANT_TYPE("(as)"), &reply))
 		return false;
+
+	g_variant_get(reply, "(as)", &iter);
+	do {
+		*list = malloc(BATCH_SIZE * sizeof(char *));
+	} while (!*list);
+	while (g_variant_iter_next(iter, "s", &child)) {
+		if (sz+2 >= asz) {
+			char **tmp;
+			asz += BATCH_SIZE;
+			do {
+				tmp = realloc(*list, asz * sizeof(char *));
+			} while  (!tmp);
+			*list = tmp;
+		}
+		do {
+			(*list)[sz] = strdup(child);
+		} while (!(*list)[sz]);
+		(*list)[sz+1] = NULL;
+		sz++;
+		g_free(child);
+	}
+
+	g_variant_iter_free(iter);
+	g_variant_unref(reply);
+
+	return true;
 }
 
 char *cgm_get_pid_cgroup(pid_t pid, const char *controller)
 {
-	char *output = NULL;
+	char *cg = NULL;
+	GVariant *reply = NULL, *v = NULL;
 
-	if (!cgcall("GetPidCgroup", g_variant_new("(si)", controller, (uint32)pid),
-				G_VARIANT_TYPE("(s)", &reply)))
+	if (!cgcall("GetPidCgroup", g_variant_new("(si)", controller, (uint32_t)pid),
+				G_VARIANT_TYPE("(s)"), &reply))
 		return NULL;
+	g_variant_get(reply, "(s)", &v);
+	g_variant_unref(reply);
+	if (g_variant_is_of_type(v, G_VARIANT_TYPE_STRING)) {
+		const char *tmp = g_variant_get_string(v, NULL);
+		do {
+			cg = strdup(tmp);
+		} while (!cg);
+	}
+
+	g_variant_unref(v);
+	return cg;
 }
 
 bool cgm_escape_cgroup(void)
@@ -296,21 +340,23 @@ bool cgm_move_pid(const char *controller, const char *cgroup, pid_t pid)
 bool cgm_get_value(const char *controller, const char *cgroup, const char *file,
 		char **value)
 {
-	if (!cgm_dbus_connect()) {
+	GVariant *reply = NULL, *v = NULL;
+
+	if (!cgcall("GetValue", g_variant_new("(sss)", controller, cgroup_manager, file),
+			G_VARIANT_TYPE("a(s)"), &reply))
 		return false;
+
+	g_variant_get(reply, "(s)", &v);
+	g_variant_unref(reply);
+	if (g_variant_is_of_type(v, G_VARIANT_TYPE_STRING)) {
+		const char *tmp = g_variant_get_string(v, NULL);
+		do {
+			*value = strdup(tmp);
+		} while (!*value);
 	}
 
-	if ( cgmanager_get_value_sync(NULL, cgroup_manager, controller, cgroup,
-			file, value) != 0 ) {
-		NihError *nerr;
-		nerr = nih_error_get();
-		fprintf(stderr, "call to get_value (%s:%s, %s) failed: %s\n", controller, cgroup, file, nerr->message);
-		nih_free(nerr);
-		cgm_dbus_disconnect();
-		return false;
-	}
+	g_variant_unref(v);
 
-	cgm_dbus_disconnect();
 	return true;
 }
 
@@ -341,8 +387,12 @@ again:
 
 bool cgm_create(const char *controller, const char *cg, uid_t uid, gid_t gid)
 {
-	int32_t e;
 	pid_t pid = fork();
+
+	if (pid < 0) {
+		g_warning("Failed to fork in cgm_create");
+		return false;
+	}
 
 	if (pid) {
 		if (wait_for_pid(pid) != 0)
@@ -377,7 +427,5 @@ bool cgm_chmod_file(const char *controller, const char *file, mode_t mode)
 
 bool cgm_remove(const char *controller, const char *cg)
 {
-	int32_t r = 0, e;
-
-	return cgcall("Remove", g_variant_new ("(ssi)", "all", path, 1), G_VARIANT_TYPE ("(i)"), NULL);
+	return cgcall("Remove", g_variant_new ("(ssi)", "all", cg, 1), G_VARIANT_TYPE ("(i)"), NULL);
 }
