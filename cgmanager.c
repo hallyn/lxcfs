@@ -310,27 +310,6 @@ bool cgm_list_children(const char *controller, const char *cgroup, char ***list)
 	return true;
 }
 
-char *cgm_get_pid_cgroup(pid_t pid, const char *controller)
-{
-	char *cg = NULL;
-	GVariant *reply = NULL, *v = NULL;
-
-	if (!cgcall("GetPidCgroup", g_variant_new("(si)", controller, (uint32_t)pid),
-				G_VARIANT_TYPE("(s)"), &reply))
-		return NULL;
-	g_variant_get(reply, "(s)", &v);
-	g_variant_unref(reply);
-	if (g_variant_is_of_type(v, G_VARIANT_TYPE_STRING)) {
-		const char *tmp = g_variant_get_string(v, NULL);
-		do {
-			cg = strdup(tmp);
-		} while (!cg);
-	}
-
-	g_variant_unref(v);
-	return cg;
-}
-
 bool cgm_escape_cgroup(void)
 {
 	return cgcall("MovePidAbs", g_variant_new("(ssi)", "all", "/", getpid()),
