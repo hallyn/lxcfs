@@ -8,15 +8,27 @@ VERSION_REVISION = 0
 VERSION_AGE      = 0
 
 AM_CFLAGS = -Wall -ggdb -D_GNU_SOURCE -DSBINDIR=\"$(SBINDIR)\" -pthread
-AM_CFLAGS += $(DBUS_CFLAGS) $(FUSE_CFLAGS) $(GLIB_CFLAGS) $(GLIBDBUS_CFLAGS) $(GIO_CFLAGS)
-AM_LDFLAGS = $(DBUS_LIBS) $(FUSE_LIBS) $(GLIB_LIBS) -pthread $(GLIBDBUS_LIBS) $(GIO_LIBS)
+AM_CFLAGS += $(FUSE_CFLAGS)
+AM_LDFLAGS = $(FUSE_LIBS) -pthread
 #AM_CFLAGS += -DDEBUG
 
 AM_CFLAGS += -DRUNTIME_PATH=\"$(RUNTIME_PATH)\" 
 
-bin_PROGRAMS = lxcfs
+liblxcfs_la_SOURCES = bindings.c cpuset.c bindings.h
+liblxcfs_la_CFLAGS = $(AM_CFLAGS)
+liblxcfs_la_LDFLAGS = $(AM_CFLAGS) -shared \
+	-Wl,-soname,liblxcfs.so.$(firstword $(subst ., ,@LXCFS_VERSION_ABI@))
 
-lxcfs_SOURCES = lxcfs.c cgfs.c cgfs.h cpuset.c
+noinst_HEADERS = bindings.h
+
+sodir=$(libdir)
+lib_LTLIBRARIES = liblxcfs.la
+
+lxcfs_SOURCES = lxcfs.c
+lxcfs_LDADD = liblxcfs.la -ldl
+lxcfs_CFLAGS = $(AM_CFLAGS)
+lxcfs_LDFLAGS = $(AM_LDFLAGS)
+bin_PROGRAMS = lxcfs
 
 EXTRA_DIST = \
 	lxcfs.man.add
@@ -58,7 +70,6 @@ distclean:
 		Makefile.in \
 		aclocal.m4 \
 		autom4te.cache/ \
-		cgfs.o \
 		compile \
 		config.guess \
 		config.h \
