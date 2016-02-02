@@ -88,4 +88,5 @@ distclean:
 		m4/ \
 		missing \
 		stamp-h1 \
-		tests/test_syscalls
+		tests/test_syscalls \
+		*.lo *.la
