@@ -107,7 +107,7 @@ static void down_users(void)
 
 static void reload_handler(int sig)
 {
-	fprintf(stderr, "lxcfs: caught a SIGHUP.  Reloading\n");
+	fprintf(stderr, "lxcfs: caught a SIGUSR1.  Reloading\n");
 	users_lock();
 	need_reload = 1;
 	users_unlock();
