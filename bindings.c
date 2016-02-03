@@ -3373,6 +3373,25 @@ out:
 	return usage;
 }
 
+#if RELOADTEST
+void iwashere(void)
+{
+	char *name, *cwd = get_current_dir_name();
+	size_t len;
+	int fd;
+
+	if (!cwd)
+		exit(1);
+	len = strlen(cwd) + strlen("/iwashere") + 1;
+	name = alloca(len);
+	snprintf(name, len, "%s/iwashere", cwd);
+	free(cwd);
+	fd = creat(name, 0755);
+	if (fd >= 0)
+		close(fd);
+}
+#endif
+
 /*
  * We read /proc/uptime and reuse its second field.
  * For the first field, we use the mtime for the reaper for
@@ -3387,6 +3406,10 @@ static int proc_uptime_read(char *buf, size_t size, off_t offset,
 	unsigned long int busytime = get_reaper_busy(fc->pid), idletime;
 	char *cache = d->buf;
 	size_t total_len = 0;
+
+#if RELOADTEST
+	iwashere();
+#endif
 
 	if (offset){
 		if (offset > d->size)

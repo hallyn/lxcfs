@@ -19,10 +19,15 @@ liblxcfs_la_CFLAGS = $(AM_CFLAGS)
 liblxcfs_la_LDFLAGS = $(AM_CFLAGS) -shared \
 	-Wl,-soname,liblxcfs.so.$(firstword $(subst ., ,@LXCFS_VERSION_ABI@))
 
+liblxcfstest_la_SOURCES = bindings.c cpuset.c bindings.h
+liblxcfstest_la_CFLAGS = $(AM_CFLAGS) -DRELOADTEST
+liblxcfstest_la_LDFLAGS = $(AM_CFLAGS) -shared \
+	-Wl,-soname,liblxcfs.so.$(firstword $(subst ., ,@LXCFS_VERSION_ABI@))
+
 noinst_HEADERS = bindings.h
 
 sodir=$(libdir)
-lib_LTLIBRARIES = liblxcfs.la
+lib_LTLIBRARIES = liblxcfs.la liblxcfstest.la
 
 lxcfs_SOURCES = lxcfs.c
 lxcfs_LDADD = liblxcfs.la -ldl
