@@ -2903,6 +2903,23 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 
 	get_mem_cached(memstat_str, &cached);
 
+	unsigned long final_memlimit = memlimit;
+	unsigned long final_swaplimit = memswlimit - memlimit;
+	if (memswlimit != 0) {
+		unsigned long swaponly = memswlimit - memlimit;
+		if (memswusage > swaponly)
+			final_memlimit -= (memswusage - swaponly);
+		final_swaplimit = memswlimit - final_memlimit;
+	}
+	unsigned long final_swapfree = final_swaplimit - (memswusage - memusage);
+
+	/*
+	 * memswlimit = limit for swap + mem
+	 * So if we have memswlimit = memlimit = 100 and swapusage = 5,
+	 * then memlimit is 95.
+	 */
+
+
 	f = fopen("/proc/meminfo", "r");
 	if (!f)
 		goto err;
@@ -2914,22 +2931,30 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 		memset(lbuf, 0, 100);
 		if (startswith(line, "MemTotal:")) {
 			sscanf(line+14, "%lu", &hosttotal);
-			if (hosttotal < memlimit)
-				memlimit = hosttotal;
-			snprintf(lbuf, 100, "MemTotal:       %8lu kB\n", memlimit);
+			if (hosttotal < final_memlimit)
+				final_memlimit = hosttotal;
+			snprintf(lbuf, 100, "MemTotal:       %8lu kB\n", final_memlimit);
 			printme = lbuf;
 		} else if (startswith(line, "MemFree:")) {
-			snprintf(lbuf, 100, "MemFree:        %8lu kB\n", memlimit - memusage);
+			sscanf(line+14, "%lu", &hosttotal);
+			unsigned long memfree = final_memlimit - memusage;
+			if (hosttotal < memfree)
+				memfree = hosttotal;
+			snprintf(lbuf, 100, "MemFree:        %8lu kB\n", memfree);
 			printme = lbuf;
 		} else if (startswith(line, "MemAvailable:")) {
-			snprintf(lbuf, 100, "MemAvailable:   %8lu kB\n", memlimit - memusage);
+			/* TODO - better metric, or just don't report this?*/
+			sscanf(line+14, "%lu", &hosttotal);
+			unsigned long memfree = final_memlimit - memusage;
+			if (hosttotal < memfree)
+				memfree = hosttotal;
+			snprintf(lbuf, 100, "MemAvailable:   %8lu kB\n", memfree);
 			printme = lbuf;
 		} else if (startswith(line, "SwapTotal:") && memswlimit > 0) {
-			snprintf(lbuf, 100, "SwapTotal:      %8lu kB\n", memswlimit - memlimit);
+			snprintf(lbuf, 100, "SwapTotal:      %8lu kB\n", final_swaplimit);
 			printme = lbuf;
 		} else if (startswith(line, "SwapFree:") && memswlimit > 0 && memswusage > 0) {
-			snprintf(lbuf, 100, "SwapFree:       %8lu kB\n", 
-				(memswlimit - memlimit) - (memswusage - memusage));
+			snprintf(lbuf, 100, "SwapFree:       %8lu kB\n", final_swapfree);
 			printme = lbuf;
 		} else if (startswith(line, "Buffers:")) {
 			snprintf(lbuf, 100, "Buffers:        %8lu kB\n", 0UL);
