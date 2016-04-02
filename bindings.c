@@ -27,6 +27,7 @@
 #include <sys/mount.h>
 #include <sys/epoll.h>
 #include <wait.h>
+#include <stdarg.h>
 
 #include "bindings.h"
 
@@ -3108,6 +3109,82 @@ static bool is_processor_line(const char *line)
 	return false;
 }
 
+/* Re-alllocate a pointer, do not fail */
+static void *must_realloc(void *orig, size_t sz)
+{
+	void *ret;
+
+	do {
+		ret = realloc(orig, sz);
+	} while (!ret);
+	return ret;
+}
+
+static int strarray_size(char **array)
+{
+	int i;
+
+	if (!array)
+		return 0;
+	for (i = 0; array[i]; i++);
+	return i;
+}
+
+static void strarray_addline(char ***array, const char *fmt, ...) __attribute__((sentinel));
+
+static void strarray_addline(char ***array, const char *fmt, ...)
+{
+	va_list ap;
+	int newlen, finlen, sz = strarray_size(*array);
+
+	va_start(ap, fmt);
+	newlen = vsnprintf(NULL, 0, fmt, ap);
+	va_end(ap);
+	if (newlen <= 0)
+		return;
+
+	*array = must_realloc(*array, (sz + 2) * sizeof(char *));
+	(*array)[sz + 1] = NULL;
+	(*array)[sz] = must_realloc(NULL, newlen + 1);
+
+	va_start(ap, fmt);
+	finlen = vsnprintf((*array)[sz], newlen + 1, fmt, ap);
+	va_end(ap);
+	if (finlen < 0 || finlen > newlen) {
+		fprintf(stderr, "strarray_addline: truncating a write!\n");
+		(*array)[sz][0] = '\0';
+	}
+}
+
+static bool strarray_tostring(char **array, char **dest, size_t *cache_sz, size_t *total_len)
+{
+	int i;
+
+	if (!array)
+		return true;
+
+	for (i = 0; array[i]; i++) {
+		size_t l = snprintf(*dest, *cache_sz, "%s", array[i]);
+		if (l < 0 || l >= *cache_sz)
+			return false;
+		*dest += l;
+		*total_len += l;
+		*cache_sz -= l;
+	}
+	return true;
+}
+
+static void strarray_free(char **array)
+{
+	int i;
+
+	if (!array)
+		return;
+	for (i = 0; array[i]; i++)
+		free(array[i]);
+	free(array);
+}
+
 static int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 		struct fuse_file_info *fi)
 {
@@ -3120,6 +3197,7 @@ static int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 	bool am_printing = false, firstline = true, is_s390x = false;
 	int curcpu = -1, cpu;
 	char *cache = d->buf;
+	char **array = NULL;
 	size_t cache_size = d->buflen;
 	FILE *f = NULL;
 
@@ -3151,7 +3229,6 @@ static int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 		goto err;
 
 	while (getline(&line, &linelen, f) != -1) {
-		size_t l;
 		if (firstline) {
 			firstline = false;
 			if (strstr(line, "IBM/S390") != NULL) {
@@ -3163,20 +3240,7 @@ static int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 			am_printing = cpuline_in_cpuset(line, cpuset);
 			if (am_printing) {
 				curcpu ++;
-				l = snprintf(cache, cache_size, "processor	: %d\n", curcpu);
-				if (l < 0) {
-					perror("Error writing to cache");
-					rv = 0;
-					goto err;
-				}
-				if (l >= cache_size) {
-					fprintf(stderr, "Internal error: truncated write to cache\n");
-					rv = 0;
-					goto err;
-				}
-				cache += l;
-				cache_size -= l;
-				total_len += l;
+				strarray_addline(&array, "processor	: %d\n", curcpu, NULL);
 			}
 			continue;
 		} else if (is_s390x && sscanf(line, "processor %d:", &cpu) == 1) {
@@ -3188,41 +3252,31 @@ static int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 			if (!p || !*p)
 				goto err;
 			p++;
-			l = snprintf(cache, cache_size, "processor %d:%s", curcpu,
-				    );
-			if (l < 0) {
-				perror("Error writing to cache");
-				rv = 0;
-				goto err;
-			}
-			if (l >= cache_size) {
-				fprintf(stderr, "Internal error: truncated write to cache\n");
-				rv = 0;
-				goto err;
-			}
-			cache += l;
-			cache_size -= l;
-			total_len += l;
+			strarray_addline(&array, "processor %d:%s", curcpu, p, NULL);
 			continue;
 
 		}
-		if (am_printing) {
-			l = snprintf(cache, cache_size, "%s", line);
-			if (l < 0) {
-				perror("Error writing to cache");
-				rv = 0;
-				goto err;
-			}
-			if (l >= cache_size) {
-				fprintf(stderr, "Internal error: truncated write to cache\n");
-				rv = 0;
-				goto err;
-			}
-			cache += l;
-			cache_size -= l;
-			total_len += l;
-		}
+		if (am_printing)
+			strarray_addline(&array, "%s", line, NULL);
 	}
+
+	if (is_s390x) {
+		size_t l = snprintf(cache, cache_size, "vendor_id       : IBM/S390\n");
+		if (l < 0 || l >= cache_size)
+			goto err;
+		cache += l;
+		cache_size -= l;
+		total_len += l;
+		l = snprintf(cache, cache_size, "# processors    : %d\n", curcpu);
+		if (l < 0 || l >= cache_size)
+			goto err;
+		cache += l;
+		cache_size -= l;
+		total_len += l;
+	}
+
+	if (!strarray_tostring(array, &cache, &cache_size, &total_len))
+		goto err;
 
 	d->cached = 1;
 	d->size = total_len;
@@ -3237,6 +3291,7 @@ err:
 	free(line);
 	free(cpuset);
 	free(cg);
+	strarray_free(array);
 	return rv;
 }
 
